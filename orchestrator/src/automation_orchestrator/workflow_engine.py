@@ -1,0 +1,803 @@
+from __future__ import annotations
+
+import math
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from threading import Lock
+from typing import Any
+
+from .audit_store import AuditStore
+from .capability_registry import CapabilityResolutionError
+from .image_builder import ImageBuildError
+from .image_registry import ImageResolutionError
+from .job_store import IdempotencyConflict
+from .models import (
+    AgentRunRequest,
+    AgentScenarioStep,
+    AgentStep,
+    CommandScenarioStep,
+    PendingRetry,
+    PendingReview,
+    PreviousStepResult,
+    ReviewDecision,
+    ReviewScenarioStep,
+    StepError,
+    StepResult,
+    StepStatusChange,
+    TriggerEvent,
+    WorkflowContext,
+    WorkflowInstance,
+)
+from .plugin_registry import PluginResolutionError
+from .sandbox_manager import SandboxExecutionError
+from .scenario_registry import ScenarioRegistry
+from .service import AgentService
+from .skill_registry import SkillResolutionError
+from .swirl_client import SwirlClient, SwirlSearchError
+from .workflow_store import WorkflowStore
+
+
+class WorkflowExecutionError(RuntimeError):
+    pass
+
+
+class CommandExecutor:
+    def execute(
+        self,
+        *,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        step: CommandScenarioStep,
+    ) -> StepResult:
+        if step.command not in {"complete", "fail", "store_failure_report"}:
+            raise WorkflowExecutionError(f"command is not allowlisted: {step.command}")
+        if step.command == "store_failure_report":
+            failed = next(
+                (result for result in reversed(workflow.executions) if result.outcome == "FAILURE"),
+                None,
+            )
+            outcome = "SUCCESS" if failed is not None else "FAILURE"
+            data = {
+                "failed_step": failed.step_id if failed else None,
+                "failure": failed.data if failed else {},
+                "artifacts": [artifact.model_dump() for artifact in failed.artifacts]
+                if failed
+                else [],
+            }
+            default_summary = (
+                "Failure report stored in workflow state"
+                if failed
+                else "No failed step result is available"
+            )
+        else:
+            outcome = "SUCCESS" if step.command == "complete" else "FAILURE"
+            data = step.parameters.get("data", {})
+            default_summary = f"Command {step.command} completed"
+        summary = str(step.parameters.get("summary", default_summary))
+        if not isinstance(data, dict):
+            raise WorkflowExecutionError("command parameters.data must be an object")
+        return StepResult(
+            step_id=step_id,
+            execution_id=self.execution_id(workflow.id, step_id, iteration, attempt),
+            iteration=iteration,
+            attempt=attempt,
+            execution_status="COMPLETED",
+            outcome=outcome,
+            data={"summary": summary, **data},
+            artifacts=[],
+        )
+
+    @staticmethod
+    def execution_id(workflow_id: str, step_id: str, iteration: int, attempt: int) -> str:
+        return f"{workflow_id}-{step_id}-{iteration}-{attempt}"
+
+
+class WorkflowEngine:
+    def __init__(
+        self,
+        scenarios: ScenarioRegistry,
+        store: WorkflowStore,
+        agent_service: AgentService,
+        *,
+        command_executor: CommandExecutor | None = None,
+        swirl_client: SwirlClient | None = None,
+        audit_store: AuditStore | None = None,
+        clock: Callable[[], datetime] | None = None,
+        max_transitions_per_run: int = 100,
+    ):
+        self.scenarios = scenarios
+        self.store = store
+        self.agent_service = agent_service
+        self.command_executor = command_executor or CommandExecutor()
+        self.swirl_client = swirl_client
+        self.audit_store = audit_store
+        self.clock = clock or (lambda: datetime.now(UTC))
+        self.max_transitions_per_run = max_transitions_per_run
+        self._creation_lock = Lock()
+
+    def create(self, event: TriggerEvent) -> tuple[WorkflowInstance, bool]:
+        scenario = self.scenarios.match(event)
+        workflow_id = self.store.workflow_id(scenario, event)
+        with self._creation_lock:
+            existing = self.store.get(workflow_id)
+            if existing is not None:
+                return existing, False
+            now = self.clock()
+            workflow = WorkflowInstance(
+                id=workflow_id,
+                scenario_id=scenario.id,
+                scenario_version=scenario.version,
+                trigger=event,
+                status="CREATED",
+                current_step=scenario.start_step,
+                created_at=now,
+                updated_at=now,
+                deadline_at=now + timedelta(seconds=scenario.timeout_seconds),
+            )
+            self.store.save(workflow)
+            self._audit(
+                workflow,
+                "workflow.created",
+                {"scenario_id": scenario.id, "source": event.source, "event": event.event},
+            )
+        return workflow, True
+
+    def start(self, event: TriggerEvent) -> WorkflowInstance:
+        workflow, created = self.create(event)
+        if not created:
+            return workflow
+        return self.advance(workflow)
+
+    def advance_safely(self, workflow: WorkflowInstance) -> WorkflowInstance:
+        try:
+            return self.advance(workflow)
+        except (OSError, RuntimeError, ValueError) as exc:
+            workflow.status = "FAILED"
+            workflow.outcome = None
+            workflow.error = StepError(
+                code="UNEXPECTED_WORKFLOW_ERROR",
+                message=str(exc),
+                retryable=False,
+            )
+            return self._save(workflow)
+
+    def get(self, workflow_id: str) -> WorkflowInstance | None:
+        return self.store.get(workflow_id)
+
+    def advance(self, workflow: WorkflowInstance) -> WorkflowInstance:
+        scenario = self.scenarios.get(workflow.scenario_id)
+        if scenario.version != workflow.scenario_version:
+            raise WorkflowExecutionError("scenario version changed during workflow execution")
+        if workflow.deadline_at is None:
+            workflow.deadline_at = workflow.created_at + timedelta(seconds=scenario.timeout_seconds)
+        if workflow.status in {"WAITING", "COMPLETED", "FAILED", "CANCELLED"}:
+            return workflow
+        terminal = self._external_terminal(workflow)
+        if terminal is not None:
+            return terminal
+        if self._deadline_exceeded(workflow):
+            return self._save(workflow)
+        workflow.status = "RUNNING"
+        for _ in range(self.max_transitions_per_run):
+            terminal = self._external_terminal(workflow)
+            if terminal is not None:
+                return terminal
+            if self._deadline_exceeded(workflow):
+                return self._save(workflow)
+            if workflow.current_step is None:
+                workflow.status = "COMPLETED"
+                workflow.outcome = self._terminal_outcome(workflow)
+                return self._save(workflow)
+            if workflow.pending_retry is not None:
+                pending_retry = workflow.pending_retry
+                if self.clock() < pending_retry.available_at:
+                    return self._save(workflow)
+                if workflow.current_step != pending_retry.step_id:
+                    raise WorkflowExecutionError("pending retry does not match current step")
+                step_id = pending_retry.step_id
+                iteration = pending_retry.iteration
+                attempt = pending_retry.next_attempt
+                workflow.pending_retry = None
+            else:
+                step_id = workflow.current_step
+                iteration = workflow.iterations.get(step_id, 0) + 1
+                workflow.iterations[step_id] = iteration
+                attempt = 1
+            step = scenario.steps[step_id]
+            if isinstance(step, ReviewScenarioStep):
+                review_ref = self._review_reference(workflow)
+                execution = self._begin_execution(
+                    workflow,
+                    step_id=step_id,
+                    iteration=iteration,
+                    attempt=attempt,
+                )
+                self._change_execution_status(workflow, execution, "READY")
+                self._change_execution_status(workflow, execution, "WAITING")
+                workflow.status = "WAITING"
+                workflow.pending_review = PendingReview(
+                    step_id=step_id,
+                    execution_id=execution.execution_id,
+                    iteration=iteration,
+                    provider=step.provider,
+                    **review_ref,
+                )
+                return self._save(workflow)
+
+            execution = self._begin_execution(
+                workflow,
+                step_id=step_id,
+                iteration=iteration,
+                attempt=attempt,
+            )
+            self._change_execution_status(workflow, execution, "READY")
+            self._change_execution_status(workflow, execution, "RUNNING")
+            result = self._execute_once(workflow, step_id, iteration, attempt, step)
+            self._finish_execution(workflow, execution.execution_id, result)
+            terminal = self._external_terminal(workflow)
+            if terminal is not None:
+                return terminal
+            self._audit(
+                workflow,
+                "workflow.step.finished",
+                {
+                    "step_id": step_id,
+                    "iteration": iteration,
+                    "attempt": result.attempt,
+                    "execution_status": result.execution_status,
+                    "outcome": result.outcome,
+                    "error_code": result.error.code if result.error else None,
+                },
+            )
+            if self._deadline_exceeded(workflow):
+                return self._save(workflow)
+            if result.execution_status == "ERROR":
+                if attempt < step.retry.max_attempts:
+                    delay_seconds = step.retry.delay_for(attempt)
+                    available_at = self.clock() + timedelta(seconds=delay_seconds)
+                    if workflow.deadline_at is None or available_at < workflow.deadline_at:
+                        workflow.pending_retry = PendingRetry(
+                            step_id=step_id,
+                            iteration=iteration,
+                            next_attempt=attempt + 1,
+                            available_at=available_at,
+                        )
+                        workflow.error = result.error
+                        self._audit(
+                            workflow,
+                            "workflow.step.retry.scheduled",
+                            {
+                                "step_id": step_id,
+                                "iteration": iteration,
+                                "next_attempt": attempt + 1,
+                                "available_at": available_at.isoformat(),
+                            },
+                        )
+                        return self._save(workflow)
+                workflow.status = "FAILED"
+                workflow.outcome = None
+                workflow.pending_retry = None
+                workflow.error = (
+                    result.error.model_copy(update={"retryable": False})
+                    if result.error is not None
+                    else None
+                )
+                return self._save(workflow)
+            workflow.error = None
+            self._transition(workflow, step, result.outcome)
+            self._save(workflow)
+        workflow.status = "FAILED"
+        workflow.outcome = None
+        workflow.error = StepError(
+            code="TRANSITION_LIMIT",
+            message="workflow exceeded the transition limit for one run",
+            retryable=False,
+        )
+        return self._save(workflow)
+
+    def review(
+        self,
+        workflow_id: str,
+        decision: ReviewDecision,
+        *,
+        advance: bool = True,
+    ) -> WorkflowInstance:
+        workflow = self.store.get(workflow_id)
+        if workflow is None:
+            raise WorkflowExecutionError(f"unknown workflow: {workflow_id}")
+        if (
+            decision.external_event_id is not None
+            and decision.external_event_id in workflow.processed_event_ids
+        ):
+            return workflow
+        if workflow.status != "WAITING" or workflow.pending_review is None:
+            raise WorkflowExecutionError("workflow is not waiting for review")
+        scenario = self.scenarios.get(workflow.scenario_id)
+        pending = workflow.pending_review
+        step = scenario.steps[pending.step_id]
+        if not isinstance(step, ReviewScenarioStep):
+            raise WorkflowExecutionError("pending workflow step is not a review")
+        workflow.review_comments.extend(decision.comments)
+        if decision.external_event_id is not None:
+            workflow.processed_event_ids.append(decision.external_event_id)
+        if not any(
+            execution.execution_id == pending.execution_id for execution in workflow.executions
+        ):
+            workflow.executions.append(
+                StepResult(
+                    step_id=pending.step_id,
+                    execution_id=pending.execution_id,
+                    iteration=pending.iteration,
+                    attempt=1,
+                    execution_status="WAITING",
+                    outcome=None,
+                    status_history=[StepStatusChange(status="WAITING", occurred_at=self.clock())],
+                )
+            )
+        self._finish_execution(
+            workflow,
+            pending.execution_id,
+            StepResult(
+                step_id=pending.step_id,
+                execution_id=pending.execution_id,
+                iteration=pending.iteration,
+                attempt=1,
+                execution_status="COMPLETED",
+                outcome=decision.outcome,
+                data={
+                    "summary": "Gitea review completed",
+                    "comments": decision.comments,
+                    "external_event_id": decision.external_event_id,
+                    "external_url": decision.external_url,
+                },
+            ),
+        )
+        workflow.pending_review = None
+        workflow.status = "RUNNING"
+        self._transition(workflow, step, decision.outcome)
+        self._audit(
+            workflow,
+            "workflow.review.completed",
+            {
+                "step_id": pending.step_id,
+                "outcome": decision.outcome,
+                "comment_count": len(decision.comments),
+                "external_event_id": decision.external_event_id,
+            },
+        )
+        self._save(workflow)
+        return self.advance(workflow) if advance else workflow
+
+    def cancel(self, workflow_id: str, *, reason: str) -> WorkflowInstance:
+        workflow = self.store.get(workflow_id)
+        if workflow is None:
+            raise WorkflowExecutionError(f"unknown workflow: {workflow_id}")
+        if workflow.status == "CANCELLED":
+            return workflow
+        if workflow.status in {"COMPLETED", "FAILED"}:
+            raise WorkflowExecutionError(f"workflow cannot be cancelled from {workflow.status}")
+        self.store.mark_cancel_requested(workflow_id)
+        now = self.clock()
+        workflow.status = "CANCELLED"
+        workflow.outcome = None
+        workflow.cancel_requested_at = now
+        workflow.cancelled_at = now
+        workflow.pending_review = None
+        workflow.pending_retry = None
+        workflow.error = StepError(
+            code="WORKFLOW_CANCELLED",
+            message=reason,
+            retryable=False,
+        )
+        self._cancel_active_execution(workflow, workflow.error)
+        self._audit(
+            workflow,
+            "workflow.cancelled",
+            {"previous_step": workflow.current_step, "reason": reason},
+        )
+        return self._save(workflow)
+
+    def retry(self, workflow_id: str, *, reason: str) -> WorkflowInstance:
+        workflow = self.store.get(workflow_id)
+        if workflow is None:
+            raise WorkflowExecutionError(f"unknown workflow: {workflow_id}")
+        if workflow.status != "FAILED":
+            raise WorkflowExecutionError(f"workflow cannot be retried from {workflow.status}")
+        if workflow.current_step is None:
+            raise WorkflowExecutionError("workflow has no step to retry")
+        scenario = self.scenarios.get(workflow.scenario_id)
+        now = self.clock()
+        workflow.status = "CREATED"
+        workflow.outcome = None
+        workflow.error = None
+        workflow.pending_review = None
+        workflow.pending_retry = None
+        workflow.deadline_at = now + timedelta(seconds=scenario.timeout_seconds)
+        workflow.cancel_requested_at = None
+        workflow.cancelled_at = None
+        self.store.clear_cancel_requested(workflow_id)
+        self._audit(
+            workflow,
+            "workflow.retry.requested",
+            {"current_step": workflow.current_step, "reason": reason},
+        )
+        return self._save(workflow)
+
+    def fail_processing(self, workflow_id: str, *, message: str) -> WorkflowInstance:
+        workflow = self.store.get(workflow_id)
+        if workflow is None:
+            raise WorkflowExecutionError(f"unknown workflow: {workflow_id}")
+        if workflow.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+            return workflow
+        error = StepError(
+            code="WORKFLOW_QUEUE_FAILED",
+            message=message[:2000],
+            retryable=True,
+        )
+        workflow.status = "FAILED"
+        workflow.outcome = None
+        workflow.pending_review = None
+        workflow.pending_retry = None
+        workflow.error = error
+        self._fail_active_execution(workflow, error)
+        self._audit(
+            workflow,
+            "workflow.queue.failed",
+            {"current_step": workflow.current_step, "message": message[:2000]},
+        )
+        return self._save(workflow)
+
+    @staticmethod
+    def _review_reference(workflow: WorkflowInstance) -> dict[str, Any]:
+        for result in reversed(workflow.executions):
+            pull = result.data.get("pull_request")
+            if not isinstance(pull, dict):
+                continue
+            repository = pull.get("repository")
+            index = pull.get("index")
+            url = pull.get("url") or pull.get("html_url")
+            return {
+                "repository": str(repository)[:300] if repository else None,
+                "pull_index": index if isinstance(index, int) and index > 0 else None,
+                "url": str(url)[:4000] if url else None,
+            }
+        return {}
+
+    @staticmethod
+    def _terminal_outcome(workflow: WorkflowInstance) -> str:
+        for execution in reversed(workflow.executions):
+            if execution.execution_status == "COMPLETED" and execution.outcome is not None:
+                return execution.outcome
+        raise WorkflowExecutionError("completed workflow has no terminal business outcome")
+
+    def _begin_execution(
+        self,
+        workflow: WorkflowInstance,
+        *,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+    ) -> StepResult:
+        now = self.clock()
+        execution = StepResult(
+            step_id=step_id,
+            execution_id=CommandExecutor.execution_id(workflow.id, step_id, iteration, attempt),
+            iteration=iteration,
+            attempt=attempt,
+            execution_status="PENDING",
+            outcome=None,
+            status_history=[StepStatusChange(status="PENDING", occurred_at=now)],
+        )
+        workflow.executions.append(execution)
+        self._audit_execution_status(workflow, execution)
+        self._save(workflow)
+        return execution
+
+    def _change_execution_status(
+        self,
+        workflow: WorkflowInstance,
+        execution: StepResult,
+        status: str,
+    ) -> None:
+        execution.execution_status = status
+        execution.status_history.append(StepStatusChange(status=status, occurred_at=self.clock()))
+        self._audit_execution_status(workflow, execution)
+        self._save(workflow)
+
+    def _finish_execution(
+        self,
+        workflow: WorkflowInstance,
+        execution_id: str,
+        result: StepResult,
+    ) -> None:
+        for index, execution in enumerate(workflow.executions):
+            if execution.execution_id != execution_id:
+                continue
+            result.status_history = [
+                *execution.status_history,
+                StepStatusChange(status=result.execution_status, occurred_at=self.clock()),
+            ]
+            workflow.executions[index] = result
+            self._audit_execution_status(workflow, result)
+            self._save(workflow)
+            return
+        raise WorkflowExecutionError(f"step execution is missing: {execution_id}")
+
+    def _audit_execution_status(
+        self,
+        workflow: WorkflowInstance,
+        execution: StepResult,
+    ) -> None:
+        self._audit(
+            workflow,
+            "workflow.step.status.changed",
+            {
+                "step_id": execution.step_id,
+                "execution_id": execution.execution_id,
+                "iteration": execution.iteration,
+                "attempt": execution.attempt,
+                "execution_status": execution.execution_status,
+            },
+        )
+
+    def _execute_once(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        step: Any,
+    ) -> StepResult:
+        if isinstance(step, CommandScenarioStep):
+            try:
+                return self.command_executor.execute(
+                    workflow=workflow,
+                    step_id=step_id,
+                    iteration=iteration,
+                    attempt=attempt,
+                    step=step,
+                )
+            except WorkflowExecutionError as exc:
+                return self._technical_error(
+                    workflow, step_id, iteration, attempt, "COMMAND_ERROR", str(exc)
+                )
+        if isinstance(step, AgentScenarioStep):
+            return self._execute_agent(workflow, step_id, iteration, attempt, step)
+        raise WorkflowExecutionError("unsupported workflow step")
+
+    def _execute_agent(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        step: AgentScenarioStep,
+    ) -> StepResult:
+        try:
+            timeout_seconds = step.timeout_seconds
+            if workflow.deadline_at is not None:
+                remaining = math.ceil((workflow.deadline_at - self.clock()).total_seconds())
+                timeout_seconds = max(1, min(timeout_seconds, remaining))
+            request = AgentRunRequest(
+                execution_id=CommandExecutor.execution_id(workflow.id, step_id, iteration, attempt),
+                workflow_id=workflow.id,
+                iteration=iteration,
+                attempt=attempt,
+                step=AgentStep(
+                    id=step_id,
+                    prompt=step.prompt,
+                    plugins=step.plugins,
+                    provider=step.provider,
+                    model=step.model,
+                    timeout_seconds=timeout_seconds,
+                ),
+                context=self._context(workflow, step),
+            )
+            return self.agent_service.run(request)
+        except (
+            CapabilityResolutionError,
+            IdempotencyConflict,
+            ImageBuildError,
+            ImageResolutionError,
+            PluginResolutionError,
+            SandboxExecutionError,
+            SkillResolutionError,
+            SwirlSearchError,
+        ) as exc:
+            return self._technical_error(
+                workflow, step_id, iteration, attempt, "AGENT_EXECUTION_ERROR", str(exc)
+            )
+
+    def _context(self, workflow: WorkflowInstance, step: AgentScenarioStep) -> WorkflowContext:
+        swirl_results: list[dict[str, Any]] = []
+        if step.context_search is not None:
+            if self.swirl_client is None:
+                raise SwirlSearchError("SWIRL context search is requested but not configured")
+            policy = step.context_search
+            query = policy.query
+            if policy.query_field is not None:
+                value: Any = workflow.trigger.data
+                for part in policy.query_field.split("."):
+                    if not isinstance(value, dict) or part not in value:
+                        raise SwirlSearchError(
+                            f"SWIRL query field is missing: {policy.query_field}"
+                        )
+                    value = value[part]
+                if not isinstance(value, (str, int, float)):
+                    raise SwirlSearchError(
+                        f"SWIRL query field must be scalar: {policy.query_field}"
+                    )
+                query = str(value)
+            response = self.swirl_client.search(
+                query or "",
+                providers=policy.providers,
+                max_results=policy.max_results,
+            )
+            swirl_results = [item.model_dump(mode="json") for item in response.results]
+        return WorkflowContext(
+            trigger_data=workflow.trigger.data,
+            scenario={
+                "workflow_id": workflow.id,
+                "scenario_id": workflow.scenario_id,
+                "scenario_version": workflow.scenario_version,
+                "current_step": workflow.current_step,
+            },
+            previous_steps=[
+                PreviousStepResult(
+                    step_id=result.step_id,
+                    execution_status=result.execution_status,
+                    outcome=result.outcome,
+                    data=result.data,
+                    artifacts=result.artifacts,
+                )
+                for result in workflow.executions
+            ],
+            review_comments=workflow.review_comments,
+            swirl_results=swirl_results,
+        )
+
+    @staticmethod
+    def _technical_error(
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        code: str,
+        message: str,
+    ) -> StepResult:
+        return StepResult(
+            step_id=step_id,
+            execution_id=CommandExecutor.execution_id(workflow.id, step_id, iteration, attempt),
+            iteration=iteration,
+            attempt=attempt,
+            execution_status="ERROR",
+            outcome=None,
+            data={},
+            artifacts=[],
+            error=StepError(code=code, message=message, retryable=True),
+        )
+
+    @staticmethod
+    def _transition(workflow: WorkflowInstance, step: Any, outcome: str | None) -> None:
+        if outcome not in {"SUCCESS", "FAILURE"}:
+            raise WorkflowExecutionError("completed step has no business outcome")
+        workflow.current_step = step.transitions[outcome]
+
+    def _external_terminal(self, workflow: WorkflowInstance) -> WorkflowInstance | None:
+        if not self.store.is_cancel_requested(workflow.id):
+            return None
+        latest = self.store.get(workflow.id)
+        if latest is not None and latest.status == "CANCELLED":
+            return latest
+        now = self.clock()
+        workflow.status = "CANCELLED"
+        workflow.cancel_requested_at = workflow.cancel_requested_at or now
+        workflow.cancelled_at = now
+        workflow.pending_review = None
+        workflow.pending_retry = None
+        workflow.error = StepError(
+            code="WORKFLOW_CANCELLED",
+            message="Cancellation was requested",
+            retryable=False,
+        )
+        self._cancel_active_execution(workflow, workflow.error)
+        return self._save(workflow)
+
+    def _cancel_active_execution(
+        self,
+        workflow: WorkflowInstance,
+        error: StepError,
+    ) -> None:
+        for execution in reversed(workflow.executions):
+            if execution.execution_status not in {"PENDING", "READY", "RUNNING", "WAITING"}:
+                continue
+            execution.execution_status = "CANCELLED"
+            execution.outcome = None
+            execution.error = error
+            execution.status_history.append(
+                StepStatusChange(status="CANCELLED", occurred_at=self.clock())
+            )
+            self._audit_execution_status(workflow, execution)
+            return
+
+    def _fail_active_execution(self, workflow: WorkflowInstance, error: StepError) -> None:
+        for execution in reversed(workflow.executions):
+            if execution.execution_status not in {"PENDING", "READY", "RUNNING", "WAITING"}:
+                continue
+            execution.execution_status = "ERROR"
+            execution.outcome = None
+            execution.error = error
+            execution.status_history.append(
+                StepStatusChange(status="ERROR", occurred_at=self.clock())
+            )
+            self._audit_execution_status(workflow, execution)
+            return
+
+    def _deadline_exceeded(self, workflow: WorkflowInstance) -> bool:
+        if workflow.deadline_at is None or self.clock() < workflow.deadline_at:
+            return False
+        workflow.status = "FAILED"
+        workflow.outcome = None
+        workflow.pending_retry = None
+        workflow.error = StepError(
+            code="WORKFLOW_DEADLINE_EXCEEDED",
+            message="workflow exceeded its overall deadline",
+            retryable=True,
+        )
+        self._audit(
+            workflow,
+            "workflow.deadline.exceeded",
+            {"deadline_at": workflow.deadline_at.isoformat()},
+        )
+        return True
+
+    def _save(self, workflow: WorkflowInstance) -> WorkflowInstance:
+        if self.store.is_cancel_requested(workflow.id) and workflow.status != "CANCELLED":
+            latest = self.store.get(workflow.id)
+            if latest is not None and latest.status == "CANCELLED":
+                return latest
+            now = self.clock()
+            workflow.status = "CANCELLED"
+            workflow.outcome = None
+            workflow.cancel_requested_at = workflow.cancel_requested_at or now
+            workflow.cancelled_at = now
+            workflow.pending_review = None
+            workflow.pending_retry = None
+            workflow.error = StepError(
+                code="WORKFLOW_CANCELLED",
+                message="Cancellation was requested",
+                retryable=False,
+            )
+            self._cancel_active_execution(workflow, workflow.error)
+        workflow.updated_at = self.clock()
+        self.store.save(workflow)
+        self._audit(
+            workflow,
+            "workflow.state.saved",
+            {
+                "status": workflow.status,
+                "outcome": workflow.outcome,
+                "current_step": workflow.current_step,
+                "execution_count": len(workflow.executions),
+                "error_code": workflow.error.code if workflow.error else None,
+            },
+        )
+        return workflow
+
+    def _audit(
+        self,
+        workflow: WorkflowInstance,
+        action: str,
+        details: dict[str, Any],
+    ) -> None:
+        if self.audit_store is None:
+            return
+        self.audit_store.record(
+            actor="orchestrator",
+            action=action,
+            resource_type="workflow",
+            resource_id=workflow.id,
+            details=details,
+        )

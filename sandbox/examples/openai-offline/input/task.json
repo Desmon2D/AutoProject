@@ -1,0 +1,7 @@
+{
+  "job_id": "openai-offline-001",
+  "prompt": "Reply with the single word OK.",
+  "provider": "openai",
+  "model": "gpt-5.6-terra",
+  "timeout_seconds": 30
+}

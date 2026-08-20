@@ -1,0 +1,9 @@
+{
+  "name": "python",
+  "version": "1.0.0",
+  "description": "Python source editing and verification instructions.",
+  "requires_capabilities": ["python"],
+  "requires_commands": ["python3"],
+  "skill_file": "SKILL.md",
+  "enabled": true
+}

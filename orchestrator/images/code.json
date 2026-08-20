@@ -1,0 +1,9 @@
+{
+  "name": "code",
+  "image": "automation-dsh-sandbox-code:0.1.0-rc.7",
+  "harness_version": "0.1.0-rc.7",
+  "capabilities": ["git", "node", "python"],
+  "plugins": ["step-result"],
+  "build_target": "code",
+  "enabled": true
+}

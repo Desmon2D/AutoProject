@@ -1,0 +1,7 @@
+{
+  "job_id": "openai-smoke-001",
+  "prompt": "Create a file named sandbox-smoke.txt containing exactly: DeepSeek Harness sandbox works. Then verify the file and briefly report what you did.",
+  "provider": "openai",
+  "model": "gpt-5.6-terra",
+  "timeout_seconds": 600
+}

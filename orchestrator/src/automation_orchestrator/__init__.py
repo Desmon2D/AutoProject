@@ -1,0 +1,1 @@
+"""Automation orchestrator modular monolith."""

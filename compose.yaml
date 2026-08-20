@@ -1,0 +1,361 @@
+x-orchestrator-environment: &orchestrator-environment
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  DEFAULT_AGENT_PROVIDER: ${DEFAULT_AGENT_PROVIDER:-openrouter}
+  DEFAULT_AGENT_MODEL: ${DEFAULT_AGENT_MODEL:-openai/gpt-4.1-nano}
+  GITEA_BASE_URL: ${GITEA_BASE_URL:-http://gitea:3000}
+  GITEA_USERNAME: ${GITEA_USERNAME:-}
+  GITEA_TOKEN: ${GITEA_TOKEN:-}
+  GITEA_ALLOWED_REPOSITORIES: ${GITEA_ALLOWED_REPOSITORIES:-}
+  GITEA_WEBHOOK_SECRET: ${GITEA_WEBHOOK_SECRET:-}
+  SWIRL_BASE_URL: ${SWIRL_BASE_URL:-}
+  SWIRL_USERNAME: ${SWIRL_USERNAME:-}
+  SWIRL_PASSWORD: ${SWIRL_PASSWORD:-}
+  SWIRL_TIMEOUT_SECONDS: ${SWIRL_TIMEOUT_SECONDS:-30}
+  SWIRL_MAX_RESULTS: ${SWIRL_MAX_RESULTS:-20}
+  ARTIFACT_TTL_SECONDS: ${ARTIFACT_TTL_SECONDS:-2592000}
+  ARTIFACT_CLEANUP_INTERVAL_SECONDS: ${ARTIFACT_CLEANUP_INTERVAL_SECONDS:-3600}
+  PLUGIN_ROOT: /app/plugins
+  SKILL_ROOT: /app/skills
+  CAPABILITY_ROOT: /app/capabilities
+  IMAGE_ROOT: /app/images
+  SCENARIO_ROOT: /app/scenarios
+  DYNAMIC_IMAGE_PREFIX: automation-dsh-sandbox-custom
+  JOBS_ROOT: /data/jobs
+  WORKFLOW_QUEUE_PATH: /data/jobs/workflow-queue.sqlite3
+  WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1}
+  WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-30}
+  WORKER_HEARTBEAT_SECONDS: ${WORKER_HEARTBEAT_SECONDS:-5}
+  WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-3}
+  WORKER_RETRY_DELAY_SECONDS: ${WORKER_RETRY_DELAY_SECONDS:-5}
+  WORKFLOW_RECONCILE_INTERVAL_SECONDS: ${WORKFLOW_RECONCILE_INTERVAL_SECONDS:-60}
+  SANDBOX_MODEL_NETWORK: automation-agent-model
+  GITEA_SANDBOX_NETWORK: automation-agent-source
+  SWIRL_SANDBOX_NETWORK: ${SWIRL_SANDBOX_NETWORK:-}
+  DASHBOARD_ORIGINS: http://127.0.0.1:4173,http://localhost:4173
+
+services:
+  plane-db:
+    profiles: ["plane"]
+    image: postgres:15.7-alpine
+    environment:
+      POSTGRES_DB: plane
+      POSTGRES_USER: plane
+      POSTGRES_PASSWORD: ${PLANE_DB_PASSWORD:-plane-local-db}
+    volumes:
+      - plane-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plane -d plane"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 256m
+    restart: unless-stopped
+
+  plane-redis:
+    profiles: ["plane"]
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - plane-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 96m
+    restart: unless-stopped
+
+  plane-rabbitmq:
+    profiles: ["plane"]
+    image: rabbitmq:3.13.6-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: plane
+      RABBITMQ_DEFAULT_PASS: ${PLANE_RABBITMQ_PASSWORD:-plane-local-rabbit}
+      RABBITMQ_DEFAULT_VHOST: plane
+    volumes:
+      - plane-rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 320m
+    restart: unless-stopped
+
+  plane-minio:
+    profiles: ["plane"]
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: plane
+      MINIO_ROOT_PASSWORD: ${PLANE_MINIO_PASSWORD:-plane-local-minio}
+    volumes:
+      - plane-minio-data:/data
+    mem_limit: 256m
+    restart: unless-stopped
+
+  plane-minio-init:
+    profiles: ["plane"]
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until mc alias set local http://plane-minio:9000 plane
+        ${PLANE_MINIO_PASSWORD:-plane-local-minio}; do sleep 1; done;
+        mc mb --ignore-existing local/plane
+    depends_on:
+      plane-minio:
+        condition: service_started
+    restart: "no"
+
+  plane:
+    profiles: ["plane"]
+    build:
+      context: .
+      dockerfile: plane/Dockerfile
+    image: automation-plane-low-memory:1.3.1
+    environment:
+      DOMAIN_NAME: localhost
+      APP_PROTOCOL: http
+      SITE_ADDRESS: ":80"
+      WEB_URL: http://localhost:8081
+      CORS_ALLOWED_ORIGINS: http://localhost:8081
+      DATABASE_URL: postgresql://plane:${PLANE_DB_PASSWORD:-plane-local-db}@plane-db:5432/plane
+      REDIS_URL: redis://plane-redis:6379/0
+      AMQP_URL: amqp://plane:${PLANE_RABBITMQ_PASSWORD:-plane-local-rabbit}@plane-rabbitmq:5672/plane
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: plane
+      AWS_SECRET_ACCESS_KEY: ${PLANE_MINIO_PASSWORD:-plane-local-minio}
+      AWS_S3_BUCKET_NAME: plane
+      AWS_S3_ENDPOINT_URL: http://plane-minio:9000
+      BUCKET_NAME: plane
+      USE_MINIO: "1"
+      MINIO_ENDPOINT_SSL: "0"
+      SECRET_KEY: ${PLANE_SECRET_KEY:-plane-local-secret-key-change-me}
+      LIVE_SERVER_SECRET_KEY: ${PLANE_LIVE_SECRET_KEY:-plane-local-live-secret-change-me}
+      GUNICORN_WORKERS: "1"
+      WEBHOOK_ALLOWED_HOSTS: orchestrator.local
+    ports:
+      - "127.0.0.1:8081:80"
+    volumes:
+      - plane-data:/app/data
+      - plane-logs:/app/logs
+    depends_on:
+      plane-db:
+        condition: service_healthy
+      plane-redis:
+        condition: service_healthy
+      plane-rabbitmq:
+        condition: service_healthy
+      plane-minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1/api/instances/', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 45s
+    mem_limit: 1200m
+    networks:
+      - default
+    restart: unless-stopped
+
+  swirl-redis:
+    profiles: ["swirl"]
+    image: redis:7.4.5-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - swirl-redis-data:/data
+    networks:
+      - swirl-backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  swirl:
+    profiles: ["swirl"]
+    image: ${SWIRL_IMAGE:-harnes-swirl:4.5.0.7}
+    entrypoint: ["/bin/sh", "/opt/automation-swirl/start-swirl.sh"]
+    environment:
+      SQL_DATABASE: /state/db.sqlite3
+      ALLOWED_HOSTS: localhost,127.0.0.1,swirl
+      CSRF_TRUSTED_ORIGINS: http://localhost:8083,http://127.0.0.1:8083
+      CELERY_BROKER_URL: redis://swirl-redis:6379/0
+      CELERY_RESULT_BACKEND: redis://swirl-redis:6379/0
+      SWIRL_PUBLIC_URL: ${SWIRL_PUBLIC_URL:-http://localhost:8083}
+      SWIRL_USERNAME: ${SWIRL_USERNAME:-admin}
+      SWIRL_PASSWORD: ${SWIRL_PASSWORD:-swirl-dev-password}
+      SWIRL_ENABLE_BEAT: ${SWIRL_ENABLE_BEAT:-false}
+      BOOKSTACK_BASE_URL: ${BOOKSTACK_BASE_URL:-}
+      BOOKSTACK_TOKEN_ID: ${BOOKSTACK_TOKEN_ID:-}
+      BOOKSTACK_TOKEN_SECRET: ${BOOKSTACK_TOKEN_SECRET:-}
+    ports:
+      - "127.0.0.1:8083:8000"
+    volumes:
+      - swirl-data:/state
+      - ./swirl/start-swirl.sh:/opt/automation-swirl/start-swirl.sh:ro
+      - ./swirl/configure_admin.py:/opt/automation-swirl/configure_admin.py:ro
+      - ./swirl/configure_bookstack.py:/opt/automation-swirl/configure_bookstack.py:ro
+      - ./swirl/searchproviders:/opt/automation-swirl/searchproviders:ro
+    networks:
+      - default
+      - swirl-backend
+      - agent-search
+    depends_on:
+      swirl-redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; connection = socket.create_connection(('127.0.0.1', 8000), 3); connection.close()"
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+
+  gitea:
+    profiles: ["gitea"]
+    image: gitea/gitea:1.24.5-rootless
+    environment:
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__indexer__REPO_INDEXER_ENABLED: "true"
+      GITEA__webhook__ALLOWED_HOST_LIST: private,loopback
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:2222:2222"
+    volumes:
+      - gitea-data:/var/lib/gitea
+      - gitea-config:/etc/gitea
+    networks:
+      - default
+      - agent-source
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/v1/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    restart: unless-stopped
+
+  swirl-lite:
+    profiles: ["lite"]
+    image: automation-orchestrator:0.1.0
+    command: ["python", "-m", "automation_orchestrator.swirl_lite"]
+    environment:
+      SWIRL_LITE_USERNAME: ${SWIRL_USERNAME:-local}
+      SWIRL_LITE_PASSWORD: ${SWIRL_PASSWORD:-local-development}
+      SWIRL_LITE_DATA_ROOT: /data
+    volumes:
+      - ./swirl/lite-data:/data:ro
+    networks:
+      - default
+      - agent-search
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+    image: automation-orchestrator:0.1.0
+    environment:
+      <<: *orchestrator-environment
+      PLANE_BASE_URL: ${PLANE_BASE_URL:-}
+      PLANE_WEBHOOK_SECRET: ${PLANE_WEBHOOK_SECRET:-}
+      PLANE_READY_STATE_IDS: ${PLANE_READY_STATE_IDS:-}
+      PLANE_READY_STATE_NAMES: ${PLANE_READY_STATE_NAMES:-}
+      PLANE_PROJECT_REPOSITORIES: ${PLANE_PROJECT_REPOSITORIES:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    group_add:
+      - "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - orchestrator-data:/data
+    networks:
+      default:
+        aliases:
+          - orchestrator.local
+    restart: unless-stopped
+
+  worker:
+    image: automation-orchestrator:0.1.0
+    command: ["python", "-m", "automation_orchestrator.worker"]
+    environment: *orchestrator-environment
+    group_add:
+      - "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - orchestrator-data:/data
+    networks:
+      - default
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+    image: automation-dashboard:0.1.0
+    ports:
+      - "127.0.0.1:4173:3000"
+    depends_on:
+      - orchestrator
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://localhost:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  orchestrator-data:
+  plane-data:
+  plane-logs:
+  plane-db-data:
+  plane-redis-data:
+  plane-rabbitmq-data:
+  plane-minio-data:
+  swirl-data:
+  swirl-redis-data:
+  gitea-data:
+    external: true
+    name: project_gitea-data
+  gitea-config:
+    external: true
+    name: project_gitea-config
+
+networks:
+  default:
+  swirl-backend:
+    name: automation-swirl-backend
+    internal: true
+  agent-search:
+    name: automation-agent-search
+    internal: true
+  agent-source:
+    name: automation-agent-source

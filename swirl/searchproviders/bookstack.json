@@ -1,0 +1,31 @@
+{
+  "name": "Local BookStack",
+  "active": true,
+  "default": false,
+  "shared": true,
+  "connector": "RequestsGet",
+  "url": "http://bookstack/api/search",
+  "query_template": "{url}?query={query_string}&count=10",
+  "query_processors": [
+    "AdaptiveQueryProcessor"
+  ],
+  "query_mappings": "",
+  "result_processors": [
+    "MappingResultProcessor",
+    "CleanTextResultProcessor",
+    "LenLimitingResultProcessor",
+    "CosineRelevancyResultProcessor"
+  ],
+  "response_mappings": "FOUND=total,RESULTS=data",
+  "result_mappings": "title=name,body=preview_html.content,date_published=updated_at,url=url,type,book.name,chapter.name,tags[*].name,tags[*].value,NO_PAYLOAD",
+  "results_per_query": 10,
+  "credentials": "",
+  "eval_credentials": "",
+  "http_request_headers": {
+    "Accept": "application/json",
+    "Authorization": "Token <token-id>:<token-secret>"
+  },
+  "tags": [
+    "bookstack"
+  ]
+}

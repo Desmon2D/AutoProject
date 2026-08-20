@@ -1,0 +1,31 @@
+{
+  "info": {
+    "search": {
+      "id": 184,
+      "query_string": "payment retry"
+    }
+  },
+  "results": [
+    {
+      "searchprovider": "Local BookStack",
+      "retrieved": 2,
+      "found": 2,
+      "json_results": [
+        {
+          "title": "Payment retry runbook",
+          "body": "Retry failed payments with an idempotency key and bounded backoff.",
+          "url": "http://bookstack/books/payments/page/retry-runbook",
+          "date_published": "2026-08-18T10:00:00Z",
+          "swirl_score": 0.94
+        },
+        {
+          "title": "Payment service overview",
+          "body": "Service ownership and operational boundaries.",
+          "url": "http://bookstack/books/payments/page/service-overview",
+          "date_published": "2026-08-12T09:00:00Z",
+          "swirl_score": 0.71
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeepSeek Harness sandbox result",
+  "type": "object",
+  "required": ["job_id", "status", "summary", "artifacts", "error"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "status": {"enum": ["success", "failure", "error"]},
+    "summary": {"type": "string"},
+    "provider": {"type": "string"},
+    "model": {"type": "string"},
+    "duration_ms": {"type": "integer", "minimum": 0},
+    "data": {"type": "object"},
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {"type": "string"},
+          "path": {"type": "string"},
+          "uri": {"type": "string"},
+          "summary": {"type": "string"}
+        },
+        "oneOf": [
+          {"required": ["path"]},
+          {"required": ["uri"]}
+        ]
+      }
+    },
+    "error": {
+      "type": ["object", "null"]
+    }
+  }
+}

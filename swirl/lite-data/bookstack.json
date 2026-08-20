@@ -1,0 +1,18 @@
+{
+  "documents": [
+    {
+      "title": "Payment retry runbook",
+      "body": "Retry failed payments with an idempotency key and bounded backoff.",
+      "url": "http://bookstack/books/payments/page/retry-runbook",
+      "source": "Local BookStack",
+      "date_published": "2026-08-18T10:00:00Z"
+    },
+    {
+      "title": "Payment service overview",
+      "body": "Service ownership, repository boundaries and operational contacts.",
+      "url": "http://bookstack/books/payments/page/service-overview",
+      "source": "Local BookStack",
+      "date_published": "2026-08-12T09:00:00Z"
+    }
+  ]
+}

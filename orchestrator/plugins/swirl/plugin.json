@@ -1,0 +1,19 @@
+{
+  "name": "swirl",
+  "version": "0.1.0",
+  "description": "Federated corporate search through SWIRL.",
+  "npm_package": "@automation/dsh-plugin-swirl",
+  "requires_capabilities": [],
+  "entrypoint": "index.js",
+  "inject": ["tools", "systemPrompt"],
+  "config": {
+    "baseUrlEnv": "SWIRL_BASE_URL",
+    "usernameEnv": "SWIRL_USERNAME",
+    "passwordEnv": "SWIRL_PASSWORD",
+    "maxResults": 20
+  },
+  "required_environment": ["SWIRL_BASE_URL", "SWIRL_USERNAME", "SWIRL_PASSWORD"],
+  "source_dir": "source",
+  "built_into_image": false,
+  "enabled": true
+}

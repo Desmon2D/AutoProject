@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeepSeek Harness sandbox task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job_id", "prompt", "provider", "model"],
+  "properties": {
+    "job_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "prompt": {"type": "string", "minLength": 1},
+    "provider": {"enum": ["openai", "openrouter"]},
+    "model": {"type": "string", "minLength": 1, "maxLength": 200},
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "plugins": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"}
+    },
+    "context_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

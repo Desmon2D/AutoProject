@@ -1,0 +1,4 @@
+examples/*/output/*
+!examples/*/output/.gitkeep
+examples/*/workspace/*
+!examples/*/workspace/.gitkeep

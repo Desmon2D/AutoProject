@@ -1,0 +1,26 @@
+FROM local/dsh-deps:0.1.0-rc.7
+
+RUN groupadd --gid 10001 sandbox \
+    && useradd --uid 10001 --gid sandbox --create-home --shell /bin/sh sandbox \
+    && mkdir -p /job/input /workspace /output /opt/sandbox \
+    && chown -R sandbox:sandbox /job /workspace /output /opt/sandbox
+
+COPY plugins/step-result /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result
+RUN node --test /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result/test/index.test.js
+
+ENV DSH_HOME=/home/sandbox/.dsh \
+    NODE_ENV=production
+
+WORKDIR /workspace
+
+COPY --chown=sandbox:sandbox runner.py /opt/sandbox/runner.py
+COPY --chown=sandbox:sandbox contracts /opt/sandbox/contracts
+COPY --chown=sandbox:sandbox --chmod=755 entrypoint.sh /opt/sandbox/entrypoint.sh
+COPY --chown=sandbox:sandbox --chmod=755 dsh-wrapper.sh /opt/sandbox/dsh-wrapper.sh
+COPY --chown=sandbox:sandbox image-profiles/code.json /opt/sandbox/image-manifest.json
+COPY --chown=sandbox:sandbox tests /opt/sandbox/tests
+RUN python3 -m unittest discover -s /opt/sandbox/tests
+
+USER sandbox
+ENTRYPOINT ["/opt/sandbox/entrypoint.sh"]
+CMD []

@@ -1,0 +1,19 @@
+{
+  "name": "gitea",
+  "version": "0.2.0",
+  "description": "Read repositories and pull requests, create pull requests, and post review comments through Gitea API.",
+  "npm_package": "@automation/dsh-plugin-gitea",
+  "requires_capabilities": ["git"],
+  "entrypoint": "index.js",
+  "inject": ["tools", "systemPrompt"],
+  "config": {
+    "baseUrlEnv": "GITEA_BASE_URL",
+    "usernameEnv": "GITEA_USERNAME",
+    "tokenEnv": "GITEA_TOKEN",
+    "allowedRepositoriesEnv": "GITEA_ALLOWED_REPOSITORIES"
+  },
+  "required_environment": ["GITEA_BASE_URL", "GITEA_USERNAME", "GITEA_TOKEN", "GITEA_ALLOWED_REPOSITORIES"],
+  "source_dir": "source",
+  "built_into_image": false,
+  "enabled": true
+}

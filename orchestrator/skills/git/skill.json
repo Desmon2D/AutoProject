@@ -1,0 +1,9 @@
+{
+  "name": "git",
+  "version": "1.0.0",
+  "description": "Git repository inspection and local change preparation instructions.",
+  "requires_capabilities": ["git"],
+  "requires_commands": ["git"],
+  "skill_file": "SKILL.md",
+  "enabled": true
+}

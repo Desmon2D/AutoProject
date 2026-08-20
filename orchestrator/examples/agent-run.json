@@ -1,0 +1,26 @@
+{
+  "execution_id": "exec-demo-001",
+  "workflow_id": "workflow-demo-001",
+  "iteration": 1,
+  "attempt": 1,
+  "step": {
+    "id": "implement",
+    "prompt": "Inspect the workspace and report which Git branch is currently checked out.",
+    "plugins": ["git", "python"],
+    "provider": "openai",
+    "model": "gpt-5.6-terra",
+    "timeout_seconds": 120
+  },
+  "context": {
+    "trigger_data": {
+      "source": "manual",
+      "ticket": "DEMO-1"
+    },
+    "scenario": {
+      "id": "demo"
+    },
+    "previous_steps": [],
+    "review_comments": [],
+    "swirl_results": []
+  }
+}

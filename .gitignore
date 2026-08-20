@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+orchestrator/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.egg-info/
+dashboard/node_modules/
+dashboard/.next/
+dashboard/dist/
+dashboard/.wrangler/
+*.log

@@ -1,0 +1,9 @@
+{
+  "name": "delivery",
+  "image": "automation-dsh-sandbox-delivery:0.1.0-rc.7",
+  "harness_version": "0.1.0-rc.7",
+  "capabilities": ["git", "node", "python"],
+  "plugins": ["gitea", "step-result", "swirl"],
+  "build_target": "delivery",
+  "enabled": true
+}

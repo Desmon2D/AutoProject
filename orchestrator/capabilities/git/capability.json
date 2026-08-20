@@ -1,0 +1,7 @@
+{
+  "name": "git",
+  "version": "2",
+  "description": "Git command-line tools for repository work.",
+  "commands": ["git"],
+  "enabled": true
+}

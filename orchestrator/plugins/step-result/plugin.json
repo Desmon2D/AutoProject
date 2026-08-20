@@ -1,0 +1,16 @@
+{
+  "name": "step-result",
+  "version": "0.1.0",
+  "description": "Mandatory structured SUCCESS/FAILURE result submission for Agent Steps.",
+  "npm_package": "@automation/dsh-plugin-step-result",
+  "requires_capabilities": [],
+  "entrypoint": "index.js",
+  "inject": ["tools", "systemPrompt"],
+  "config": {
+    "outputPath": "/output/agent-result.json",
+    "maxSummaryLength": 4000
+  },
+  "built_into_image": true,
+  "mandatory": true,
+  "enabled": true
+}

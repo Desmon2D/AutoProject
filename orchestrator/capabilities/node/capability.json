@@ -1,0 +1,7 @@
+{
+  "name": "node",
+  "version": "24",
+  "description": "Node.js runtime bundled with DeepSeek Harness.",
+  "commands": ["node", "npm"],
+  "enabled": true
+}

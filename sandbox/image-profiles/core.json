@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "profile": "core",
+  "harness_version": "0.1.0-rc.7",
+  "capabilities": ["node", "python"],
+  "plugins": {
+    "step-result": {
+      "version": "0.1.0",
+      "entrypoint": "/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result/index.js",
+      "inject": ["tools", "systemPrompt"],
+      "config": {
+        "outputPath": "/output/agent-result.json",
+        "maxSummaryLength": 4000
+      },
+      "mandatory": true
+    }
+  }
+}

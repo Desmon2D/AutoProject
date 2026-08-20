@@ -1,0 +1,42 @@
+{
+  "id": "manual-review",
+  "version": "1",
+  "trigger": {
+    "source": "manual",
+    "event": "review-demo"
+  },
+  "start_step": "record-trigger",
+  "steps": {
+    "record-trigger": {
+      "type": "command",
+      "command": "complete",
+      "parameters": {
+        "summary": "Trigger accepted"
+      },
+      "transitions": {
+        "SUCCESS": "review",
+        "FAILURE": null
+      }
+    },
+    "review": {
+      "type": "review",
+      "provider": "gitea",
+      "transitions": {
+        "SUCCESS": "finish",
+        "FAILURE": "finish"
+      }
+    },
+    "finish": {
+      "type": "command",
+      "command": "complete",
+      "parameters": {
+        "summary": "Workflow finalized"
+      },
+      "transitions": {
+        "SUCCESS": null,
+        "FAILURE": null
+      }
+    }
+  },
+  "enabled": true
+}

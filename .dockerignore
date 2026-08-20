@@ -1,0 +1,12 @@
+.git
+.env
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.next
+**/.wrangler
+**/dist
+dashboard/node_modules
+orchestrator/.venv
+sandbox/examples/*/output
+sandbox/examples/*/workspace

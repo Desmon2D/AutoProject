@@ -1,0 +1,7 @@
+{
+  "name": "python",
+  "version": "3",
+  "description": "Python runtime for sandbox execution and Python-oriented agent work.",
+  "commands": ["python3"],
+  "enabled": true
+}
