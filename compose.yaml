@@ -18,7 +18,7 @@ x-orchestrator-environment: &orchestrator-environment
   PLUGIN_ROOT: /app/plugins
   SKILL_ROOT: /app/skills
   CAPABILITY_ROOT: /app/capabilities
-  IMAGE_ROOT: /app/images
+  IMAGE_ROOT: /app/image-catalog
   SCENARIO_ROOT: /app/scenarios
   DYNAMIC_IMAGE_PREFIX: automation-dsh-sandbox-custom
   JOBS_ROOT: /data/jobs
@@ -113,7 +113,7 @@ services:
     profiles: ["plane"]
     build:
       context: .
-      dockerfile: plane/Dockerfile
+      dockerfile: infra/plane/Dockerfile
     image: automation-plane-low-memory:1.3.1
     environment:
       DOMAIN_NAME: localhost
@@ -201,10 +201,10 @@ services:
       - "127.0.0.1:8083:8000"
     volumes:
       - swirl-data:/state
-      - ./swirl/start-swirl.sh:/opt/automation-swirl/start-swirl.sh:ro
-      - ./swirl/configure_admin.py:/opt/automation-swirl/configure_admin.py:ro
-      - ./swirl/configure_bookstack.py:/opt/automation-swirl/configure_bookstack.py:ro
-      - ./swirl/searchproviders:/opt/automation-swirl/searchproviders:ro
+      - ./infra/swirl/start-swirl.sh:/opt/automation-swirl/start-swirl.sh:ro
+      - ./infra/swirl/configure_admin.py:/opt/automation-swirl/configure_admin.py:ro
+      - ./infra/swirl/configure_bookstack.py:/opt/automation-swirl/configure_bookstack.py:ro
+      - ./infra/swirl/searchproviders:/opt/automation-swirl/searchproviders:ro
     networks:
       - default
       - swirl-backend
@@ -259,7 +259,7 @@ services:
       SWIRL_LITE_PASSWORD: ${SWIRL_PASSWORD:-local-development}
       SWIRL_LITE_DATA_ROOT: /data
     volumes:
-      - ./swirl/lite-data:/data:ro
+      - ./infra/swirl/lite-data:/data:ro
     networks:
       - default
       - agent-search

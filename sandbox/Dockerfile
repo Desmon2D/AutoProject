@@ -17,7 +17,7 @@ RUN apt-get update \
     && chown -R sandbox:sandbox /job /workspace /output /opt/sandbox \
     && rm -rf /var/lib/apt/lists/*
 
-COPY sandbox/plugins/step-result /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result
+COPY orchestrator/plugins/step-result/source /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result
 RUN node --test /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result/test/index.test.js
 
 ENV DSH_HOME=/home/sandbox/.dsh \
@@ -30,7 +30,7 @@ COPY --chown=sandbox:sandbox sandbox/runner.py /opt/sandbox/runner.py
 COPY --chown=sandbox:sandbox sandbox/contracts /opt/sandbox/contracts
 COPY --chown=sandbox:sandbox --chmod=755 sandbox/dsh-wrapper.sh /opt/sandbox/dsh-wrapper.sh
 COPY --chown=sandbox:sandbox --chmod=755 sandbox/git-askpass.py /opt/sandbox/git-askpass.py
-COPY --chown=sandbox:sandbox sandbox/image-profiles/core.json /opt/sandbox/image-manifest.json
+COPY --chown=sandbox:sandbox sandbox/runtime-manifests/core.json /opt/sandbox/image-manifest.json
 COPY --chown=sandbox:sandbox sandbox/tests /opt/sandbox/tests
 RUN python3 -m unittest discover -s /opt/sandbox/tests
 
@@ -45,7 +45,7 @@ USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
-COPY --chown=sandbox:sandbox sandbox/image-profiles/code.json /opt/sandbox/image-manifest.json
+COPY --chown=sandbox:sandbox sandbox/runtime-manifests/code.json /opt/sandbox/image-manifest.json
 USER sandbox
 
 FROM code AS delivery
@@ -55,5 +55,5 @@ COPY orchestrator/plugins/gitea/source /usr/local/lib/node_modules/@deepseek-ai/
 COPY orchestrator/plugins/swirl/source /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-swirl
 RUN node --test /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-gitea/test/index.test.js \
     && node --test /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-swirl/test/index.test.js
-COPY --chown=sandbox:sandbox sandbox/image-profiles/delivery.json /opt/sandbox/image-manifest.json
+COPY --chown=sandbox:sandbox sandbox/runtime-manifests/delivery.json /opt/sandbox/image-manifest.json
 USER sandbox

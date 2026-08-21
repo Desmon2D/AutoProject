@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $envFile = Join-Path $root ".env"
 $docker = "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"
 if (-not (Test-Path -LiteralPath $docker)) {

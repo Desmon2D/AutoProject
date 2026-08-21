@@ -100,7 +100,13 @@ def test_normalizes_bookstack_results_from_fixture():
 
 
 def test_bookstack_provider_template_is_scoped_and_contains_no_secret():
-    template = Path(__file__).parents[2] / "swirl" / "searchproviders" / "bookstack.json"
+    template = (
+        Path(__file__).parents[2]
+        / "infra"
+        / "swirl"
+        / "searchproviders"
+        / "bookstack.json"
+    )
     provider = json.loads(template.read_text(encoding="utf-8"))
 
     assert provider["connector"] == "RequestsGet"

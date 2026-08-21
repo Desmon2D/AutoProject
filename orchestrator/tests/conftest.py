@@ -37,7 +37,7 @@ def capability_root() -> Path:
 
 @pytest.fixture
 def image_root() -> Path:
-    return Path(__file__).parents[1] / "images"
+    return Path(__file__).parents[1] / "image-catalog"
 
 
 @pytest.fixture

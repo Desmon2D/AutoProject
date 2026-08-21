@@ -5,7 +5,7 @@ RUN groupadd --gid 10001 sandbox \
     && mkdir -p /job/input /workspace /output /opt/sandbox \
     && chown -R sandbox:sandbox /job /workspace /output /opt/sandbox
 
-COPY plugins/step-result /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result
+COPY orchestrator/plugins/step-result/source /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result
 RUN node --test /usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/@automation/dsh-plugin-step-result/test/index.test.js
 
 ENV DSH_HOME=/home/sandbox/.dsh \
@@ -13,12 +13,12 @@ ENV DSH_HOME=/home/sandbox/.dsh \
 
 WORKDIR /workspace
 
-COPY --chown=sandbox:sandbox runner.py /opt/sandbox/runner.py
-COPY --chown=sandbox:sandbox contracts /opt/sandbox/contracts
-COPY --chown=sandbox:sandbox --chmod=755 entrypoint.sh /opt/sandbox/entrypoint.sh
-COPY --chown=sandbox:sandbox --chmod=755 dsh-wrapper.sh /opt/sandbox/dsh-wrapper.sh
-COPY --chown=sandbox:sandbox image-profiles/code.json /opt/sandbox/image-manifest.json
-COPY --chown=sandbox:sandbox tests /opt/sandbox/tests
+COPY --chown=sandbox:sandbox sandbox/runner.py /opt/sandbox/runner.py
+COPY --chown=sandbox:sandbox sandbox/contracts /opt/sandbox/contracts
+COPY --chown=sandbox:sandbox --chmod=755 sandbox/entrypoint.sh /opt/sandbox/entrypoint.sh
+COPY --chown=sandbox:sandbox --chmod=755 sandbox/dsh-wrapper.sh /opt/sandbox/dsh-wrapper.sh
+COPY --chown=sandbox:sandbox sandbox/runtime-manifests/code.json /opt/sandbox/image-manifest.json
+COPY --chown=sandbox:sandbox sandbox/tests /opt/sandbox/tests
 RUN python3 -m unittest discover -s /opt/sandbox/tests
 
 USER sandbox

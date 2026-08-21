@@ -28,7 +28,7 @@ This module is the first vertical slice of the modular monolith:
 Run from the repository root:
 
 ```powershell
-.\scripts\start-low-memory.ps1
+.\scripts\dev\start-low-memory.ps1
 Invoke-RestMethod http://localhost:8080/health
 ```
 
@@ -38,17 +38,17 @@ On a memory-constrained workstation, use the lightweight stack instead of keepin
 SWIRL, and Redis running:
 
 ```powershell
-.\scripts\start-low-memory.ps1
+.\scripts\dev\start-low-memory.ps1
 ```
 
 It runs the orchestrator, worker, dashboard, and an 18–25 MiB SWIRL-compatible local search
-service backed by editable files in `swirl/lite-data/`. On the current development machine the
+service backed by editable files in `infra/swirl/lite-data/`. On the current development machine the
 whole stack uses about 200 MiB of container memory. Add local Gitea only when needed with
 `-WithGitea`, or use `-CoreOnly` to disable search as well.
 
 The lightweight service preserves the SWIRL HTTP contract for development but does not replace
-full federated search. Run `scripts/start-dev-swirl.ps1` only for a dedicated full integration
-check; return to the lightweight mode by running `scripts/start-low-memory.ps1` again.
+full federated search. Run `scripts/dev/start-dev-swirl.ps1` only for a dedicated full integration
+check; return to the lightweight mode by running `scripts/dev/start-low-memory.ps1` again.
 
 The operations dashboard is available at `http://127.0.0.1:4173`. It refreshes
 health, workflow, scenario, plugin, skill, and image data every ten seconds.
@@ -67,7 +67,7 @@ Configure a key and run a real end-to-end check through the orchestrator,
 DeepSeek Harness, OpenRouter, and the plugin with:
 
 ```powershell
-.\scripts\configure-openrouter.ps1
+.\scripts\setup\configure-openrouter.ps1
 ```
 
 The key prompt is hidden. The script validates the key and model against
@@ -79,7 +79,7 @@ OpenAI remains available as a second native provider. Its standalone smoke check
 is:
 
 ```powershell
-.\scripts\openai-smoke.ps1
+.\scripts\smoke\openai-smoke.ps1
 ```
 
 The `/health` response reports only whether each provider credential is
@@ -146,7 +146,7 @@ and the external `project_gitea-data` and `project_gitea-config` volumes. Start 
 and configure the scoped orchestrator token with:
 
 ```powershell
-.\scripts\start-dev-gitea.ps1
+.\scripts\dev\start-dev-gitea.ps1
 ```
 
 The command verifies a real clone and push to the persistent
@@ -159,7 +159,7 @@ available to the host at
 Verify the native plugin from a generated DeepSeek Harness image with:
 
 ```powershell
-.\scripts\gitea-plugin-smoke.ps1
+.\scripts\smoke\gitea-plugin-smoke.ps1
 ```
 
 The external volumes are a deliberate dependency of this development workspace.
@@ -257,7 +257,7 @@ image runs with dedicated Redis and persistent `swirl-data` / `swirl-redis-data`
 worker with its connection settings, and verify the real Search API with:
 
 ```powershell
-.\scripts\start-dev-swirl.ps1
+.\scripts\dev\start-dev-swirl.ps1
 ```
 
 The UI is available at `http://localhost:8083/galaxy/`. Override `SWIRL_IMAGE`,
@@ -293,7 +293,7 @@ After configuring OpenRouter, Gitea, and SWIRL, launch a live smoke workflow fro
 root:
 
 ```powershell
-.\scripts\implement-ticket-smoke.ps1 -TicketId A-1 -Summary "Fix payment retry"
+.\scripts\smoke\implement-ticket-smoke.ps1 -TicketId A-1 -Summary "Fix payment retry"
 ```
 
 Compose publishes the API only on `127.0.0.1` for the local client.

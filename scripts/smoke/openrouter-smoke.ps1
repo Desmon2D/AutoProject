@@ -4,12 +4,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $docker = "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"
 $envFile = Join-Path $root ".env"
 if (-not (Test-Path -LiteralPath $docker)) { throw "Docker CLI not found: $docker" }
 if (-not (Test-Path -LiteralPath $envFile)) {
-    throw "Run scripts/configure-openrouter.ps1 first"
+    throw "Run scripts/setup/configure-openrouter.ps1 first"
 }
 if (-not ([IO.File]::ReadAllLines($envFile) | Where-Object {
     $_.StartsWith("OPENROUTER_API_KEY=", [StringComparison]::Ordinal) -and
