@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
+import re
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -22,6 +24,15 @@ def _text(value: Any, *, limit: int) -> str:
     if not isinstance(value, str):
         value = str(value)
     return " ".join(value.split())[:limit]
+
+
+def _plain_text(value: Any, *, limit: int) -> str:
+    text = _text(value, limit=limit * 2)
+    text = re.sub(r"\bstrong\b\s*(?=<em\b)", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(</em>)\s*\bstrong\b", r"\1 ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]{1,200}>", " ", text)
+    text = " ".join(html.unescape(text).split())
+    return re.sub(r"\s+([.,;:!?])", r"\1", text)[:limit]
 
 
 def _number(value: Any) -> float | None:
@@ -74,7 +85,7 @@ def normalize_swirl_response(
     seen: set[tuple[str, str]] = set()
     for item in _result_items(payload):
         url = _text(item.get("url") or item.get("link") or item.get("uri"), limit=4000)
-        title = _text(item.get("title") or item.get("name") or url, limit=1000)
+        title = _plain_text(item.get("title") or item.get("name") or url, limit=1000)
         if not url or not title:
             continue
         key = (url, title)
@@ -84,7 +95,7 @@ def normalize_swirl_response(
         results.append(
             SwirlSearchResult(
                 title=title,
-                snippet=_text(
+                snippet=_plain_text(
                     item.get("snippet")
                     or item.get("body")
                     or item.get("description")
@@ -92,7 +103,7 @@ def normalize_swirl_response(
                     limit=2000,
                 ),
                 url=url,
-                source=_text(
+                source=_plain_text(
                     item.get("source")
                     or item.get("searchprovider")
                     or item.get("provider")
@@ -100,7 +111,7 @@ def normalize_swirl_response(
                     or "unknown",
                     limit=300,
                 ),
-                updated_at=_text(
+                updated_at=_plain_text(
                     item.get("date_published")
                     or item.get("date_updated")
                     or item.get("updated_at"),

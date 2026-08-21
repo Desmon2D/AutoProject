@@ -1,5 +1,5 @@
 param(
-    [string]$Model = "openai/gpt-4.1-nano",
+    [string]$Model = "z-ai/glm-4.7-flash",
     [switch]$SkipSmoke,
     [switch]$SkipBuild
 )

@@ -69,7 +69,6 @@ try {
             id = "openai-smoke"
             prompt = "Confirm that the OpenAI-backed DeepSeek Harness agent is running. Call submit_step_result exactly once with outcome SUCCESS, a short summary, data containing connectivity=true, and no artifacts."
             plugins = @()
-            skills = @()
             provider = "openai"
             model = $Model
             timeout_seconds = 180

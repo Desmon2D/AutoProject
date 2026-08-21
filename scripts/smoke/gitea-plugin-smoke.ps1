@@ -33,7 +33,6 @@ $payload = @{
         id = "inspect-repository"
         prompt = "Inspect the configured development repository"
         plugins = @("gitea")
-        skills = @("git")
         provider = "openai"
         model = "smoke-model"
         timeout_seconds = 60

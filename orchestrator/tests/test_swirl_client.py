@@ -36,13 +36,13 @@ def test_normalizes_grouped_results_and_deduplicates():
                     "searchprovider": "Confluence",
                     "json_results": [
                         {
-                            "title": "Runbook",
-                            "body": "  Safe   excerpt ",
+                            "title": "<em>Runbook</em>",
+                            "body": "  Safe strong <em>excerpt</em> strong &amp; guidance ",
                             "url": "https://kb/runbook",
                             "score": 0,
                         },
                         {
-                            "title": "Runbook",
+                            "title": "<em>Runbook</em>",
                             "body": "duplicate",
                             "url": "https://kb/runbook",
                         },
@@ -56,7 +56,8 @@ def test_normalizes_grouped_results_and_deduplicates():
     assert response.search_id == "42"
     assert len(response.results) == 1
     assert response.results[0].source == "Confluence"
-    assert response.results[0].snippet == "Safe excerpt"
+    assert response.results[0].title == "Runbook"
+    assert response.results[0].snippet == "Safe excerpt & guidance"
     assert response.results[0].score == 0
 
 

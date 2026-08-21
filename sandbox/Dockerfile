@@ -29,7 +29,6 @@ USER sandbox
 COPY --chown=sandbox:sandbox sandbox/runner.py /opt/sandbox/runner.py
 COPY --chown=sandbox:sandbox sandbox/contracts /opt/sandbox/contracts
 COPY --chown=sandbox:sandbox --chmod=755 sandbox/dsh-wrapper.sh /opt/sandbox/dsh-wrapper.sh
-COPY --chown=sandbox:sandbox --chmod=755 sandbox/git-askpass.py /opt/sandbox/git-askpass.py
 COPY --chown=sandbox:sandbox sandbox/runtime-manifests/core.json /opt/sandbox/image-manifest.json
 COPY --chown=sandbox:sandbox sandbox/tests /opt/sandbox/tests
 RUN python3 -m unittest discover -s /opt/sandbox/tests
@@ -43,7 +42,7 @@ FROM harness-runtime AS code
 
 USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends git python3-pytest \
     && rm -rf /var/lib/apt/lists/*
 COPY --chown=sandbox:sandbox sandbox/runtime-manifests/code.json /opt/sandbox/image-manifest.json
 USER sandbox

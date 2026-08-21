@@ -64,8 +64,10 @@ if ([string]::IsNullOrWhiteSpace($adminPassword)) {
 }
 
 Set-DotEnvValue "PLANE_BASE_URL" "http://plane"
+Set-DotEnvValue "PLANE_WORKSPACE_SLUG" "automation"
 Set-DotEnvValue "PLANE_WEBHOOK_SECRET" $webhookSecret
 Set-DotEnvValue "PLANE_READY_STATE_NAMES" "Ready for development"
+Set-DotEnvValue "PLANE_TESTING_STATE_NAMES" "Testing"
 Set-DotEnvValue "PLANE_ADMIN_EMAIL" $adminEmail
 Set-DotEnvValue "PLANE_ADMIN_PASSWORD" $adminPassword
 Set-DotEnvValue "PLANE_PROJECT_REPOSITORIES" (@{
@@ -226,6 +228,26 @@ $headers = @{
     "Referer" = "http://127.0.0.1:8081/"
 }
 
+$apiToken = Get-DotEnvValue "PLANE_API_TOKEN"
+if ([string]::IsNullOrWhiteSpace($apiToken)) {
+    $tokenResponse = Invoke-RestMethod `
+        -Method Post `
+        -Uri "http://127.0.0.1:8081/api/users/api-tokens/" `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{
+            label = "AutoProject orchestrator"
+            description = "Local workflow result synchronization"
+        } | ConvertTo-Json -Compress) `
+        -WebSession $session `
+        -TimeoutSec 30
+    $apiToken = $tokenResponse.token
+    if ([string]::IsNullOrWhiteSpace($apiToken)) {
+        throw "Plane did not return an API token"
+    }
+    Set-DotEnvValue "PLANE_API_TOKEN" $apiToken
+}
+
 $projectList = Invoke-RestMethod `
     -Uri "http://127.0.0.1:8081/api/workspaces/$workspaceSlug/projects/" `
     -WebSession $session `
@@ -278,6 +300,60 @@ if ($null -eq $readyState) {
         -TimeoutSec 30
 }
 Set-DotEnvValue "PLANE_READY_STATE_IDS" $readyState.id
+$testingState = $states | Where-Object { $_.name -eq "Testing" } | Select-Object -First 1
+if ($null -eq $testingState) {
+    $testingState = Invoke-RestMethod `
+        -Method Post `
+        -Uri $stateUrl `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{
+            name = "Testing"
+            color = "#F59E0B"
+            group = "started"
+            description = "Ready for automated test creation and execution"
+            sequence = 25000
+        } | ConvertTo-Json -Compress) `
+        -WebSession $session `
+        -TimeoutSec 30
+}
+Set-DotEnvValue "PLANE_TESTING_STATE_IDS" $testingState.id
+$completedState = $states | Where-Object { $_.group -eq "completed" } | Select-Object -First 1
+if ($null -eq $completedState) {
+    $completedState = Invoke-RestMethod `
+        -Method Post `
+        -Uri $stateUrl `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{
+            name = "Done"
+            color = "#16A34A"
+            group = "completed"
+            description = "Validated change was accepted"
+            sequence = 35000
+        } | ConvertTo-Json -Compress) `
+        -WebSession $session `
+        -TimeoutSec 30
+}
+Set-DotEnvValue "PLANE_COMPLETED_STATE_IDS" $completedState.id
+$cancelledState = $states | Where-Object { $_.group -eq "cancelled" } | Select-Object -First 1
+if ($null -eq $cancelledState) {
+    $cancelledState = Invoke-RestMethod `
+        -Method Post `
+        -Uri $stateUrl `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{
+            name = "Cancelled"
+            color = "#DC2626"
+            group = "cancelled"
+            description = "Validated change was rejected"
+            sequence = 45000
+        } | ConvertTo-Json -Compress) `
+        -WebSession $session `
+        -TimeoutSec 30
+}
+Set-DotEnvValue "PLANE_CANCELLED_STATE_IDS" $cancelledState.id
 
 $webhookUrl = "http://orchestrator.local:8080/v1/webhooks/plane"
 $webhookResponse = Invoke-RestMethod `

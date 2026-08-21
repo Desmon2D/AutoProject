@@ -35,8 +35,20 @@ class DockerImageBuilder:
             return spec.image
         client = self.client_factory()
         try:
-            client.images.get(spec.image)
-            return spec.image
+            base_image = client.images.get(spec.base_image)
+            base_image_id = base_image.id
+        except (ImageNotFound, DockerException) as exc:
+            raise ImageBuildError(
+                f"cannot inspect base sandbox image {spec.base_image}: {exc}"
+            ) from exc
+        try:
+            current = client.images.get(spec.image)
+            labels = current.labels or {}
+            if (
+                labels.get("automation.image-spec") == spec.digest
+                and labels.get("automation.base-image-id") == base_image_id
+            ):
+                return spec.image
         except ImageNotFound:
             pass
         except DockerException as exc:
@@ -51,6 +63,7 @@ class DockerImageBuilder:
                 buildargs={"BASE_IMAGE": spec.base_image},
                 labels={
                     "automation.image-spec": spec.digest,
+                    "automation.base-image-id": base_image_id,
                     "automation.sandbox-profile": spec.profile,
                 },
                 rm=True,

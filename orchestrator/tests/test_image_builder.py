@@ -7,6 +7,29 @@ from automation_orchestrator.models import ImageSpec, PluginManifest
 from automation_orchestrator.plugin_registry import PluginRegistry
 
 
+class FakeImage:
+    def __init__(self, image_id: str, labels: dict[str, str] | None = None):
+        self.id = image_id
+        self.labels = labels or {}
+
+
+class FakeImages:
+    def __init__(self, images: dict[str, FakeImage]):
+        self.images = images
+        self.builds = []
+
+    def get(self, name: str):
+        return self.images[name]
+
+    def build(self, **kwargs):
+        self.builds.append(kwargs)
+
+
+class FakeClient:
+    def __init__(self, images: FakeImages):
+        self.images = images
+
+
 def test_build_context_contains_plugin_and_deterministic_manifest(tmp_path: Path):
     plugin_root = tmp_path / "plugins"
     source = plugin_root / "example" / "source"
@@ -45,3 +68,47 @@ def test_build_context_contains_plugin_and_deterministic_manifest(tmp_path: Path
     assert manifest["plugins"]["example"]["entrypoint"].endswith(
         "/@automation/dsh-plugin-example/index.js"
     )
+
+
+def test_rebuilds_custom_image_when_base_image_changed(tmp_path: Path):
+    plugin_root = tmp_path / "plugins"
+    source = plugin_root / "example" / "source"
+    source.mkdir(parents=True)
+    (source / "index.js").write_text("export function apply() {}\n", encoding="utf-8")
+    plugin = PluginManifest(
+        name="example",
+        version="1.2.3",
+        description="test",
+        npm_package="@automation/dsh-plugin-example",
+        entrypoint="index.js",
+        source_dir="source",
+    )
+    spec = ImageSpec(
+        profile="code",
+        base_image="automation-code:1",
+        image="automation-custom:abc",
+        harness_version="1",
+        capabilities=["python"],
+        plugins=["example"],
+        digest="abc",
+        requires_build=True,
+    )
+    images = FakeImages(
+        {
+            spec.base_image: FakeImage("sha256:new-base"),
+            spec.image: FakeImage(
+                "sha256:custom",
+                {
+                    "automation.image-spec": spec.digest,
+                    "automation.base-image-id": "sha256:old-base",
+                },
+            ),
+        }
+    )
+    builder = DockerImageBuilder(
+        PluginRegistry(plugin_root), client_factory=lambda: FakeClient(images)
+    )
+
+    assert builder.ensure(spec, [plugin]) == spec.image
+    assert len(images.builds) == 1
+    assert images.builds[0]["labels"]["automation.base-image-id"] == "sha256:new-base"

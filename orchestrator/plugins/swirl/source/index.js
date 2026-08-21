@@ -34,6 +34,22 @@ function clean(value, maxLength) {
   return String(value ?? "").replace(/\s+/gu, " ").trim().slice(0, maxLength);
 }
 
+function plain(value, maxLength) {
+  return clean(
+    String(value ?? "")
+      .replace(/\bstrong\b\s*(?=<em\b)/giu, " ")
+      .replace(/(<\/em>)\s*\bstrong\b/giu, "$1 ")
+      .replace(/<[^>]{1,200}>/gu, " ")
+      .replace(/&amp;/gu, "&")
+      .replace(/&lt;/gu, "<")
+      .replace(/&gt;/gu, ">")
+      .replace(/&quot;/gu, '"')
+      .replace(/&#39;/gu, "'")
+      .replace(/\s+([.,;:!?])/gu, "$1"),
+    maxLength,
+  );
+}
+
 function items(payload) {
   const root = payload?.structured && typeof payload.structured === "object"
     ? payload.structured
@@ -60,7 +76,7 @@ export function normalizeSearch(payload, query, limit) {
   const seen = new Set();
   for (const item of items(payload)) {
     const url = clean(item.url ?? item.link ?? item.uri, 4000);
-    const title = clean(item.title ?? item.name ?? url, 1000);
+    const title = plain(item.title ?? item.name ?? url, 1000);
     if (!url || !title) continue;
     const key = `${url}\u0000${title}`;
     if (seen.has(key)) continue;
@@ -69,9 +85,9 @@ export function normalizeSearch(payload, query, limit) {
     const score = rawScore === undefined || rawScore === null ? null : Number(rawScore);
     results.push({
       title,
-      snippet: clean(item.snippet ?? item.body ?? item.description ?? item.content, 2000),
+      snippet: plain(item.snippet ?? item.body ?? item.description ?? item.content, 2000),
       url,
-      source: clean(
+      source: plain(
         item.source ?? item.searchprovider ?? item.provider ?? item._parent_source ?? "unknown",
         300,
       ),

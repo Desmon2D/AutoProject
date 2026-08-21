@@ -1,7 +1,10 @@
 param(
     [string]$Title = "Document the payment retry smoke scenario",
     [string]$Description = "Create AUTOMATION_SMOKE.md. Add a short section titled Payment retry smoke scenario, explain that this file verifies the local automation path, and state that no application behavior is changed. Do not modify application code. Run the relevant repository checks.",
-    [string]$ProjectIdentifier = "PAY"
+    [string]$ProjectIdentifier = "PAY",
+    [ValidateSet("Ready for development", "Testing")]
+    [string]$StateName = "Ready for development",
+    [string]$ImplementationRef = "main"
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,10 +82,14 @@ $stateResponse = Invoke-RestMethod `
     -WebSession $session `
     -TimeoutSec 20
 $states = @(Expand-ResponseItems $stateResponse)
-$readyState = $states | Where-Object { $_.name -eq "Ready for development" } | Select-Object -First 1
-if ($null -eq $readyState) { throw "Plane state 'Ready for development' was not found" }
+$targetState = $states | Where-Object { $_.name -eq $StateName } | Select-Object -First 1
+if ($null -eq $targetState) { throw "Plane state '$StateName' was not found" }
 
-$encodedDescription = [Net.WebUtility]::HtmlEncode($Description)
+$effectiveDescription = $Description
+if ($StateName -eq "Testing") {
+    $effectiveDescription += "`n`nAutomation implementation ref: $ImplementationRef"
+}
+$encodedDescription = [Net.WebUtility]::HtmlEncode($effectiveDescription)
 try {
     $issue = Invoke-RestMethod `
         -Method Post `
@@ -92,7 +99,7 @@ try {
         -Body (@{
             name = $Title
             description_html = "<p>$encodedDescription</p>"
-            state_id = $readyState.id
+            state_id = $targetState.id
         } | ConvertTo-Json -Compress) `
         -WebSession $session `
         -TimeoutSec 30
@@ -121,5 +128,4 @@ if ($null -eq $workflow) {
 
 Write-Output "Plane ticket created: $ProjectIdentifier-$($issue.sequence_id)"
 Write-Output "Workflow queued: $($workflow.id) ($($workflow.status))"
-Write-Output "Continue in low-memory execution mode:"
-Write-Output "  .\scripts\dev\start-low-memory.ps1 -WithGitea"
+Write-Output "Plane state: $StateName"

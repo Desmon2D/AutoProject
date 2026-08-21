@@ -194,6 +194,25 @@ export function apply(ctx, config = {}) {
         const base = text(args.base, "base");
         const markers = operationMarkers(args.workflow_id, args.idempotency_key);
         const repositoryRoot = repositoryPath(owner, repository);
+        const expectedHead = `automation/${markers.workflowId}`;
+        if (head !== expectedHead) {
+          throw new Error(`head must be the stable workflow branch ${expectedHead}`);
+        }
+        const openPulls = await request(
+          client,
+          `${repositoryRoot}/pulls?state=open&limit=100`,
+          { signal: exec.signal },
+        );
+        const markedPull = Array.isArray(openPulls)
+          ? openPulls.find((pull) =>
+              String(pull?.body ?? "").includes(
+                `automation-idempotency-key: ${markers.idempotencyKey}`,
+              ),
+            )
+          : undefined;
+        if (markedPull) {
+          return { ...markedPull, automation_reused: true };
+        }
         const existing = await request(
           client,
           `${repositoryRoot}/pulls/${segment(base)}/${segment(head)}`,

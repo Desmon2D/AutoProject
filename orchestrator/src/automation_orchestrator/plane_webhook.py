@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from dataclasses import dataclass
@@ -9,6 +10,12 @@ from typing import Any
 from .models import TriggerEvent
 
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+REPOSITORY_MARKER = re.compile(
+    r"(?im)^\s*Automation repository:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s*$"
+)
+IMPLEMENTATION_REF_MARKER = re.compile(
+    r"(?im)^\s*Automation implementation ref:\s*([A-Za-z0-9][A-Za-z0-9._/-]{0,199})\s*$"
+)
 
 
 class PlaneWebhookError(ValueError):
@@ -51,6 +58,8 @@ def normalize_plane_webhook(
     repositories: dict[str, str],
     ready_state_ids: set[str],
     ready_state_names: set[str],
+    testing_state_ids: set[str] | None = None,
+    testing_state_names: set[str] | None = None,
 ) -> PlaneWebhookResult:
     event = str(payload.get("event", "")).strip().casefold()
     action = str(payload.get("action", "")).strip().casefold()
@@ -68,32 +77,48 @@ def normalize_plane_webhook(
         raise PlaneWebhookError("Plane issue has no name")
 
     state_ids, state_names = _state_values(data)
+    testing_state_ids = testing_state_ids or set()
+    testing_state_names = testing_state_names or set()
+    explicitly_testing = data.get("ready_for_testing") is True or data.get("testing") is True
+    configured_testing = bool(
+        state_ids.intersection(testing_state_ids)
+        or state_names.intersection(testing_state_names)
+    )
     explicitly_ready = data.get("ready_for_development") is True
     configured_ready = bool(
         state_ids.intersection(ready_state_ids) or state_names.intersection(ready_state_names)
     )
-    if not explicitly_ready and not configured_ready:
-        return PlaneWebhookResult(trigger=None, reason="issue is not ready for development")
+    if explicitly_testing or configured_testing:
+        trigger_event = "issue.testing"
+    elif explicitly_ready or configured_ready:
+        trigger_event = "issue.ready_for_development"
+    else:
+        return PlaneWebhookResult(trigger=None, reason="issue is not in an actionable state")
 
     project_references = _project_references(data)
-    repository = next(
+    project_id, project_identifier = _project_identity(data)
+    mapped_repository = next(
         (repositories[reference] for reference in project_references if reference in repositories),
         None,
     )
-    if repository is None:
-        raise PlaneWebhookError("Plane project has no Gitea repository mapping")
-
-    webhook_id = str(payload.get("webhook_id", "")).strip()
-    changed_at = _first_text(data, "updated_at", "created_at") or "unknown"
-    stable_source = f"{webhook_id}:{event}:{action}:{issue_id}:{changed_at}"
-    event_id = f"plane-{hashlib.sha256(stable_source.encode()).hexdigest()[:32]}"
     description = _first_text(
         data,
         "description_stripped",
         "description_html",
         "description",
     )
-
+    task_repository, implementation_ref = _automation_source(description)
+    if task_repository is not None and task_repository != mapped_repository:
+        raise PlaneWebhookError(
+            "Plane task repository does not match its allowed project repository"
+        )
+    repository = task_repository or mapped_repository
+    if repository is None:
+        raise PlaneWebhookError("Plane project has no Gitea repository mapping")
+    webhook_id = str(payload.get("webhook_id", "")).strip()
+    changed_at = _first_text(data, "updated_at", "created_at") or "unknown"
+    stable_source = f"{webhook_id}:{trigger_event}:{action}:{issue_id}:{changed_at}"
+    event_id = f"plane-{hashlib.sha256(stable_source.encode()).hexdigest()[:32]}"
     normalized = {
         "ticket": {
             "id": issue_id,
@@ -105,10 +130,15 @@ def normalize_plane_webhook(
             "state_names": sorted(state_names),
         },
         "project": {
+            "id": project_id,
+            "identifier": project_identifier,
             "references": project_references,
             "workspace_id": payload.get("workspace_id"),
         },
-        "repository": {"full_name": repository},
+        "repository": {
+            "full_name": repository,
+            "implementation_ref": implementation_ref,
+        },
         "plane": {
             "delivery": delivery,
             "webhook_id": webhook_id or None,
@@ -121,7 +151,7 @@ def normalize_plane_webhook(
     return PlaneWebhookResult(
         trigger=TriggerEvent(
             source="plane",
-            event="issue.ready_for_development",
+            event=trigger_event,
             event_id=event_id,
             data=normalized,
         )
@@ -180,3 +210,38 @@ def _project_references(data: dict[str, Any]) -> list[str]:
             if isinstance(reference, str) and reference.strip():
                 references.append(reference.strip())
     return list(dict.fromkeys(references))
+
+
+def _project_identity(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    project = data.get("project")
+    if isinstance(project, str) and project.strip():
+        return project.strip(), None
+    if not isinstance(project, dict):
+        project = data.get("project_detail")
+    if not isinstance(project, dict):
+        return None, None
+    project_id = project.get("id")
+    identifier = project.get("identifier")
+    return (
+        project_id.strip() if isinstance(project_id, str) and project_id.strip() else None,
+        identifier.strip() if isinstance(identifier, str) and identifier.strip() else None,
+    )
+
+
+def _automation_source(description: str | None) -> tuple[str | None, str | None]:
+    if description is None:
+        return None, None
+    plain = html.unescape(re.sub(r"<[^>]{1,500}>", "\n", description))
+    repository_match = REPOSITORY_MARKER.search(plain)
+    ref_match = IMPLEMENTATION_REF_MARKER.search(plain)
+    implementation_ref = ref_match.group(1) if ref_match else None
+    if implementation_ref is not None and (
+        ".." in implementation_ref
+        or "//" in implementation_ref
+        or implementation_ref.endswith(("/", ".lock"))
+    ):
+        raise PlaneWebhookError("Testing task has an invalid implementation ref")
+    return (
+        repository_match.group(1) if repository_match else None,
+        implementation_ref,
+    )

@@ -11,7 +11,7 @@ test("normalizes and bounds SWIRL result groups", () => {
         {
           searchprovider: "Confluence",
           json_results: [
-            { title: "Runbook", body: "  Safe   excerpt  ", url: "https://kb/runbook", score: "0.9" },
+            { title: "<em>Runbook</em>", body: "  Safe strong <em>excerpt</em> strong &amp; guidance  ", url: "https://kb/runbook", score: "0.9" },
             { title: "Ignored", body: "extra", url: "https://kb/extra" },
           ],
         },
@@ -25,7 +25,7 @@ test("normalizes and bounds SWIRL result groups", () => {
   assert.deepEqual(result.results, [
     {
       title: "Runbook",
-      snippet: "Safe excerpt",
+      snippet: "Safe excerpt & guidance",
       url: "https://kb/runbook",
       source: "Confluence",
       updated_at: null,

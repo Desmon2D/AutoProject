@@ -1,5 +1,5 @@
 param(
-    [string]$Model = "openai/gpt-4.1-nano",
+    [string]$Model = "z-ai/glm-4.7-flash",
     [switch]$SkipBuild
 )
 
@@ -51,7 +51,6 @@ try {
             id = "openrouter-smoke"
             prompt = "Verify the DeepSeek Harness OpenRouter connection. Call submit_step_result exactly once with outcome SUCCESS, a short summary, data containing connectivity=true, and no artifacts."
             plugins = @()
-            skills = @()
             provider = "openrouter"
             model = $Model
             timeout_seconds = 180

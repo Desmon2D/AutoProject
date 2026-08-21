@@ -6,16 +6,18 @@ from pathlib import Path
 from .audit_store import AuditStore
 from .capability_registry import CapabilityRegistry
 from .context_builder import ContextBuilder
+from .gitea_client import GiteaClient
 from .image_builder import DockerImageBuilder
 from .image_registry import ImageRegistry
 from .image_resolver import AgentImageResolver
+from .plane_client import PlaneClient
 from .plugin_registry import PluginRegistry
 from .sandbox_manager import SandboxManager
 from .scenario_registry import ScenarioRegistry
 from .service import AgentService
 from .skill_registry import SkillRegistry
 from .swirl_client import SwirlClient
-from .workflow_engine import WorkflowEngine
+from .workflow_engine import CommandExecutor, WorkflowEngine
 from .workflow_queue import WorkflowQueue
 from .workflow_store import WorkflowStore
 
@@ -71,6 +73,10 @@ def build_service() -> AgentService:
         service.scenario_registry,
         WorkflowStore(jobs_root / "workflows"),
         service,
+        command_executor=CommandExecutor(
+            GiteaClient.from_environment(),
+            PlaneClient.from_environment(),
+        ),
         swirl_client=SwirlClient.from_environment(),
         audit_store=service.audit_store,
     )

@@ -26,6 +26,7 @@ from .models import (
     AuditEvent,
     BuiltContext,
     CapabilityManifest,
+    IgnoredWebhook,
     ImageProfileManifest,
     PluginManifest,
     PreparedAgentStep,
@@ -107,7 +108,11 @@ def _review_comments(payload: dict[str, Any]) -> list[str]:
     comments: list[str] = []
     for key in ("review", "comment"):
         item = payload.get(key)
-        body = item.get("body") if isinstance(item, dict) else None
+        body = (
+            item.get("body") or item.get("content")
+            if isinstance(item, dict)
+            else None
+        )
         if isinstance(body, str) and body.strip():
             comments.append(body.strip()[:4000])
     return comments
@@ -190,7 +195,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             },
             "default_agent": {
                 "provider": os.environ.get("DEFAULT_AGENT_PROVIDER", "openrouter"),
-                "model": os.environ.get("DEFAULT_AGENT_MODEL", "openai/gpt-4.1-nano"),
+                "model": os.environ.get("DEFAULT_AGENT_MODEL", "z-ai/glm-4.7-flash"),
             },
             "queue": current.workflow_queue.summary(),
         }
@@ -313,6 +318,10 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 ),
                 ready_state_ids=parse_csv(os.environ.get("PLANE_READY_STATE_IDS", "")),
                 ready_state_names=parse_csv(os.environ.get("PLANE_READY_STATE_NAMES", "")),
+                testing_state_ids=parse_csv(os.environ.get("PLANE_TESTING_STATE_IDS", "")),
+                testing_state_names=parse_csv(
+                    os.environ.get("PLANE_TESTING_STATE_NAMES", "")
+                ),
             )
         except PlaneWebhookError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -330,7 +339,8 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         if engine is None:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
         try:
-            workflow, created = engine.create(normalized.trigger)
+            trigger = engine.attach_plane_implementation(normalized.trigger)
+            workflow, created = engine.create(trigger)
             enqueued = False
             if workflow.status in {"CREATED", "RUNNING"}:
                 enqueued = request.app.state.service.workflow_queue.enqueue(workflow.id)
@@ -358,10 +368,12 @@ def create_app(service: AgentService | None = None) -> FastAPI:
 
     @application.post(
         "/v1/webhooks/gitea",
-        response_model=WorkflowInstance,
+        response_model=WorkflowInstance | IgnoredWebhook,
         status_code=status.HTTP_202_ACCEPTED,
     )
-    async def receive_gitea_webhook(request: Request) -> WorkflowInstance:
+    async def receive_gitea_webhook(
+        request: Request,
+    ) -> WorkflowInstance | IgnoredWebhook:
         secret = os.environ.get("GITEA_WEBHOOK_SECRET", "").strip()
         if not secret:
             raise HTTPException(status_code=503, detail="Gitea webhook is not configured")
@@ -401,13 +413,35 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         engine = getattr(request.app.state.service, "workflow_engine", None)
         if engine is None:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
-        if event_type in GITEA_REVIEW_OUTCOMES:
+        pull_action = str(payload.get("action") or "").lower()
+        is_pull_closed = event_type in GITEA_PULL_EVENTS and pull_action in {
+            "closed",
+            "merged",
+        }
+        if event_type in GITEA_REVIEW_OUTCOMES or is_pull_closed:
             workflow_id = _workflow_marker(payload)
             if workflow_id is None:
-                raise HTTPException(status_code=422, detail="Gitea review has no workflow marker")
+                raise HTTPException(status_code=422, detail="Gitea decision has no workflow marker")
             workflow = engine.get(workflow_id)
             if workflow is None:
                 raise HTTPException(status_code=404, detail="workflow not found")
+            pending = workflow.pending_review
+            if pending is None:
+                return workflow
+            if pending.decision == "merge":
+                if not is_pull_closed:
+                    return workflow
+                pull = payload.get("pull_request")
+                merged = (
+                    pull_action == "merged"
+                    or isinstance(pull, dict)
+                    and pull.get("merged") is True
+                )
+                decision_outcome = "SUCCESS" if merged else "FAILURE"
+            else:
+                if event_type not in GITEA_REVIEW_OUTCOMES:
+                    return workflow
+                decision_outcome = GITEA_REVIEW_OUTCOMES[event_type]
             comment = payload.get("comment")
             comment_body = comment.get("body") if isinstance(comment, dict) else None
             if (
@@ -423,19 +457,15 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             if isinstance(pull, dict):
                 candidate = pull.get("number") or pull.get("index")
                 pull_index = candidate if isinstance(candidate, int) else None
-            pending = workflow.pending_review
-            if pending is not None:
-                if pending.repository and pending.repository != full_name:
-                    raise HTTPException(status_code=409, detail="review repository does not match")
-                if pending.pull_index and pending.pull_index != pull_index:
-                    raise HTTPException(
-                        status_code=409, detail="review pull request does not match"
-                    )
+            if pending.repository and pending.repository != full_name:
+                raise HTTPException(status_code=409, detail="review repository does not match")
+            if pending.pull_index and pending.pull_index != pull_index:
+                raise HTTPException(status_code=409, detail="review pull request does not match")
             try:
                 workflow = engine.review(
                     workflow_id,
                     ReviewDecision(
-                        outcome=GITEA_REVIEW_OUTCOMES[event_type],
+                        outcome=decision_outcome,
                         comments=_review_comments(payload),
                         external_event_id=delivery,
                         external_url=pull.get("html_url") if isinstance(pull, dict) else None,
@@ -454,7 +484,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                     details={
                         "event_type": event_type,
                         "delivery": delivery,
-                        "outcome": GITEA_REVIEW_OUTCOMES[event_type],
+                        "outcome": decision_outcome,
                     },
                 )
                 return workflow
@@ -512,6 +542,19 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="Gitea push has no repository full_name")
         if not isinstance(ref, str) or not ref.strip():
             raise HTTPException(status_code=422, detail="Gitea push has no ref")
+        if event_type == "push" and ref.startswith("refs/heads/automation/"):
+            _audit_request(
+                request,
+                action="gitea.webhook.ignored",
+                resource_type="webhook",
+                outcome="SUCCESS",
+                details={
+                    "event_type": event_type,
+                    "delivery": delivery,
+                    "reason": "automation branch push",
+                },
+            )
+            return IgnoredWebhook(reason="automation branch push is handled by its parent workflow")
         try:
             workflow, created = engine.create(
                 TriggerEvent(

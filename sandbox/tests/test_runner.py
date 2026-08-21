@@ -17,13 +17,15 @@ from runner import build_plugin_patch, configure_git_auth, configure_provider, l
 
 class LoadAgentResultTests(unittest.TestCase):
     @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "Unix sockets require Linux")
-    def test_configures_git_askpass_without_writing_token(self) -> None:
+    def test_configures_git_credentials_without_writing_token(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            askpass = Path(runner.__file__).with_name("git-askpass.py")
-            auth_socket = Path(directory) / "git-auth.sock"
+            auth_dir = Path(directory) / ".automation-git-auth"
+            auth_socket = auth_dir / "git-auth.sock"
+            credential_config = auth_dir / "gitconfig"
             with (
-                patch.object(runner, "GIT_ASKPASS_PATH", askpass),
-                patch.object(runner, "GIT_ASKPASS_SOCKET", auth_socket),
+                patch.object(runner, "GIT_AUTH_DIR", auth_dir),
+                patch.object(runner, "GIT_CREDENTIAL_SOCKET", auth_socket),
+                patch.object(runner, "GIT_CREDENTIAL_CONFIG", credential_config),
                 patch.dict(
                     "os.environ",
                     {"GITEA_USERNAME": "harnes", "GITEA_TOKEN": "secret-token"},
@@ -41,11 +43,11 @@ class LoadAgentResultTests(unittest.TestCase):
                 finally:
                     server.close()
 
-                script = askpass.read_text(encoding="utf-8")
-                self.assertEqual(runner.os.environ["GIT_ASKPASS"], str(askpass))
+                self.assertEqual(
+                    runner.os.environ["GIT_CONFIG_GLOBAL"], str(credential_config)
+                )
                 self.assertEqual(runner.os.environ["GIT_TERMINAL_PROMPT"], "0")
-                self.assertNotIn("harnes", script)
-                self.assertNotIn("secret-token", script)
+                self.assertFalse(credential_config.exists())
 
     def test_configures_native_openrouter_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

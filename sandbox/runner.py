@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -18,8 +20,9 @@ WORKSPACE_DIR = Path("/workspace")
 DSH_HOME = Path(os.environ.get("DSH_HOME", "/home/sandbox/.dsh"))
 AGENT_RESULT_PATH = OUTPUT_DIR / "agent-result.json"
 IMAGE_MANIFEST_PATH = Path("/opt/sandbox/image-manifest.json")
-GIT_ASKPASS_PATH = Path("/opt/sandbox/git-askpass.py")
-GIT_ASKPASS_SOCKET = Path("/tmp/automation-git-askpass.sock")
+GIT_AUTH_DIR = WORKSPACE_DIR / ".automation-git-auth"
+GIT_CREDENTIAL_SOCKET = GIT_AUTH_DIR / "git-credential.sock"
+GIT_CREDENTIAL_CONFIG = GIT_AUTH_DIR / "gitconfig"
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,200}$")
 PLUGIN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -151,11 +154,19 @@ def configure_provider(provider: str, model: str) -> None:
     (DSH_HOME / "settings.yaml").write_text(settings, encoding="utf-8")
 
 
-class GitAskpassServer:
-    def __init__(self, username: str, token: str, path: Path):
+class GitCredentialServer:
+    def __init__(
+        self,
+        username: str,
+        token: str,
+        path: Path,
+        *,
+        config_path: Path | None = None,
+    ):
         self.username = username
         self.token = token
         self.path = path
+        self.config_path = config_path
         self._stop = threading.Event()
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.path.unlink(missing_ok=True)
@@ -187,19 +198,57 @@ class GitAskpassServer:
         self._socket.close()
         self._thread.join(timeout=1)
         self.path.unlink(missing_ok=True)
+        if self.config_path is not None:
+            self.config_path.unlink(missing_ok=True)
+            try:
+                self.config_path.parent.rmdir()
+            except OSError:
+                pass
 
 
-def configure_git_auth() -> GitAskpassServer | None:
+def configure_git_auth() -> GitCredentialServer | None:
     token = os.environ.get("GITEA_TOKEN", "").strip()
     if not token:
         return None
     username = os.environ.get("GITEA_USERNAME", "").strip()
     if not username:
         raise ValueError("GITEA_USERNAME is required when GITEA_TOKEN is configured")
-    os.environ["GIT_ASKPASS"] = str(GIT_ASKPASS_PATH)
+    GIT_AUTH_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    helper_code = (
+        "import os,socket\n"
+        "path=os.environ['AUTOMATION_GIT_AUTH_SOCKET']\n"
+        "for key,prompt in (('username',b'Username'),('password',b'Password')):\n"
+        " client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+        " client.connect(path)\n"
+        " client.sendall(prompt)\n"
+        " client.shutdown(socket.SHUT_WR)\n"
+        " print(key+'='+client.recv(4096).decode())\n"
+        " client.close()"
+    )
+    encoded_helper = base64.b64encode(helper_code.encode("utf-8")).decode("ascii")
+    helper_command = (
+        "!/usr/bin/python3 -c "
+        + shlex.quote(
+            f"import base64;exec(base64.b64decode('{encoded_helper}'))"
+        )
+    )
+    config_helper = helper_command.replace("\\", "\\\\").replace('"', '\\"')
+    GIT_CREDENTIAL_CONFIG.write_text(
+        f'[credential]\n\thelper = "{config_helper}"\n',
+        encoding="utf-8",
+    )
+    GIT_CREDENTIAL_CONFIG.chmod(0o400)
+    # GIT_CONFIG_KEY_* is scrubbed by the model shell because its name looks
+    # credential-like. A dedicated config file avoids that ambient variable.
+    os.environ["GIT_CONFIG_GLOBAL"] = str(GIT_CREDENTIAL_CONFIG)
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
-    os.environ["AUTOMATION_GIT_AUTH_SOCKET"] = str(GIT_ASKPASS_SOCKET)
-    return GitAskpassServer(username, token, GIT_ASKPASS_SOCKET)
+    os.environ["AUTOMATION_GIT_AUTH_SOCKET"] = str(GIT_CREDENTIAL_SOCKET)
+    return GitCredentialServer(
+        username,
+        token,
+        GIT_CREDENTIAL_SOCKET,
+        config_path=GIT_CREDENTIAL_CONFIG,
+    )
 
 
 def build_plugin_patch(

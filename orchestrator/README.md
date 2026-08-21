@@ -56,10 +56,10 @@ health, workflow, scenario, plugin, skill, and image data every ten seconds.
 ## Model providers
 
 The default development provider is native DeepSeek Harness `openrouter` with
-`openai/gpt-4.1-nano`. The model is inexpensive and advertises tool calling,
+`z-ai/glm-4.7-flash`. The model is inexpensive and advertises tool calling,
 which is required by the native `step-result` plugin.
 
-The `implement-ticket` scenario uses `openai/gpt-4.1-mini`: repository editing,
+The `implement-ticket` scenario uses `openai/gpt-4.1`: repository editing,
 Git operations, and pull-request creation require stronger tool use than the
 default event-summary tasks.
 
@@ -172,11 +172,11 @@ parsed. The webhook returns `202 Accepted` after persisting an idempotent workfl
 and enqueueing its identifier. The separate `worker` container then runs the agent,
 so Gitea and the dashboard are not blocked by model latency.
 
-The `gitea-push` scenario uses OpenRouter `openai/gpt-4.1-nano` to summarize the
-normalized push event through the mandatory `step-result` tool. Commit messages
-are explicitly treated as untrusted data. The development script makes one commit
-to the persistent `automation-connectivity` branch and finishes only after the
-agent workflow returns `COMPLETED / SUCCESS`.
+The `gitea-push` scenario uses OpenRouter `openai/gpt-4.1-nano` to summarize ordinary
+normalized push events through the mandatory `step-result` tool. Pushes to
+`refs/heads/automation/*` are ignored because their parent workflow already tracks them; this
+prevents duplicate dashboard entries and model calls. Commit messages are explicitly treated as
+untrusted data.
 
 The queue is a SQLite database in the shared persistent `/data` volume. A worker
 claims one workflow with a renewable lease. After a worker crash the lease expires
@@ -212,12 +212,12 @@ the policy moves the workflow to `FAILED`; business `FAILURE` follows the scenar
 is not retried automatically.
 
 A completed workflow exposes its terminal business `outcome` separately from technical `status`.
-The implementation failure route ends as `COMPLETED / FAILURE`; only an approved pull request
-ends as `COMPLETED / SUCCESS`.
+The implementation failure route ends as `COMPLETED / FAILURE`; a successfully pushed
+implementation branch ends as `COMPLETED / SUCCESS` and is ready for the testing workflow.
 
-Command Steps use an explicit allowlist (`complete` and `fail`); arbitrary shell
-commands are not accepted. Review Steps pause in `WAITING` until the review endpoint
-receives `SUCCESS` or `FAILURE`. Agent Steps reuse the same Context Builder,
+Command Steps use an explicit allowlist; arbitrary shell commands are not accepted. Review Steps
+can wait either for an intermediate review decision or for the pull request to be merged or closed.
+They pause in `WAITING` without retaining a worker or agent container. Agent Steps reuse the same Context Builder,
 Image Resolver, sandbox, and result contract as the standalone agent API.
 
 Each scenario has an overall `timeout_seconds` (one day by default). The remaining workflow time
@@ -232,15 +232,61 @@ Agent containers do not receive that socket.
 
 The `plane.issue.ready_for_development` trigger starts the `implement-ticket` scenario. The
 signed Plane webhook normalizes a ready issue and maps its project to an allowed Gitea repository.
-The scenario performs a
-bounded SWIRL context search, runs the delivery agent with Git, Gitea, and SWIRL, creates or
-reuses one pull request, and waits for a signed Gitea review webhook. A rejected review returns
-comments to a new implementation iteration; approval completes the workflow without merging.
+The scenario performs a bounded SWIRL context search and runs the delivery agent with Git, Gitea,
+and SWIRL. The agent pushes `automation/<workflow_id>` and returns its exact commit without
+creating a pull request. The workflow records `plane_recommendation=move_to_testing`.
+
+## Ticket testing workflow
+
+The `plane.issue.testing` trigger starts the `test-ticket` scenario. The repository is always
+derived from the allowed Plane project mapping and must not be duplicated in the issue
+description. When the same issue previously completed `implement-ticket`, the orchestrator
+automatically supplies that workflow's exact branch and commit. For a standalone testing issue
+without a preceding implementation workflow, add two structured Plane links titled
+`Рабочая ветка: branch` and `Коммит реализации: full-40-character-hash`. The legacy
+`Automation implementation ref: branch` description marker remains supported for older tasks.
+Its two agent roles are strictly separated:
+
+1. `write-tests` reads the Plane requirements and the implementation at the supplied exact
+   commit when available, writes only test code, and pushes one stable `automation/<workflow_id>` branch without
+   executing tests or creating a pull request;
+2. `execute-tests` checks out the exact commit returned by the author, cannot edit repository
+   files, runs the project test command, and returns a structured `PASSED`, `PRODUCT_FAILURE`, or
+   `TEST_CODE_ERROR` report;
+3. after `PASSED`, the orchestrator creates one final pull request from that exact tested branch
+   to the repository default branch and enters `WAITING`;
+4. merging the pull request completes the workflow successfully, while closing it without merge
+   completes the workflow with a business failure. Review approval alone does not finish this
+   final wait.
+
+Invalid test code may return to the author once. No pull request is created for invalid tests or a
+product failure. Every final result is written to the Plane issue as an idempotent comment. A
+product failure returns the issue to `Ready for development`, a merged final pull moves it to the
+configured completed state, and a pull closed without merge moves it to the configured cancelled
+state. A successful implementation records its exact branch and commit but leaves the state
+unchanged so that the user controls when testing starts.
+
+The Community edition used locally does not expose arbitrary custom work-item fields. The branch
+and commit therefore use Plane's built-in Links section as two separately visible structured
+values. Their URLs open the exact Gitea branch and commit. When an external developer supplies
+both links and moves the issue to `Testing`, the testing workflow reads them through the Plane API.
+
+Configure `PLANE_TESTING_STATE_IDS` or `PLANE_TESTING_STATE_NAMES` (the local default is
+`Testing`). For a local trigger, create a Plane issue directly in that state with:
+
+```powershell
+.\scripts\dev\submit-dev-ticket.ps1 -StateName Testing -ImplementationRef "feature/payment-reference" -Title "Test payment reference validation" -Description "Write automated tests for the implemented payment reference rules."
+```
 
 For local development set `PLANE_WEBHOOK_SECRET`, `PLANE_READY_STATE_IDS` or
 `PLANE_READY_STATE_NAMES`, and `PLANE_PROJECT_REPOSITORIES`. The last value is a JSON object whose
 keys are Plane project identifiers or IDs and whose values are Gitea repositories in `owner/name`
 format. Repeated deliveries for the same issue revision reuse the existing workflow.
+
+Writing workflow results back requires `PLANE_API_TOKEN`, `PLANE_WORKSPACE_SLUG`,
+`PLANE_COMPLETED_STATE_IDS`, and `PLANE_CANCELLED_STATE_IDS`. The local Plane setup script creates
+the token and state mappings and passes them to both the orchestrator and worker. Comment external
+IDs contain the workflow and result, so a safe retry does not create duplicate comments.
 
 Gitea write operations require `GITEA_ALLOWED_REPOSITORIES` as a comma-separated allowlist.
 PR and comment tools require `workflow_id` and a stable `idempotency_key` and reuse an existing

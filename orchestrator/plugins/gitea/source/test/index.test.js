@@ -49,6 +49,12 @@ test("registers Gitea tools and performs authenticated API requests", async () =
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     calls.push({ url, options });
+    if (url.endsWith("/pulls?state=open&limit=100")) {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     if (options.method === "GET") {
       return new Response(JSON.stringify({ message: "not found" }), {
         status: 404,
@@ -78,7 +84,7 @@ test("registers Gitea tools and performs authenticated API requests", async () =
         owner: "team",
         repository: "service",
         title: "Agent changes",
-        head: "agent/work",
+        head: "automation/wf-123",
         base: "main",
         body: "Ready for review",
         workflow_id: "wf-123",
@@ -89,15 +95,19 @@ test("registers Gitea tools and performs authenticated API requests", async () =
     assert.equal(result.id, 7);
     assert.equal(
       calls[0].url,
-      "https://gitea.example.test/api/v1/repos/team/service/pulls/main/agent%2Fwork",
+      "https://gitea.example.test/api/v1/repos/team/service/pulls?state=open&limit=100",
     );
-    assert.equal(calls[1].url, "https://gitea.example.test/api/v1/repos/team/service/pulls");
-    assert.equal(calls[1].options.method, "POST");
-    assert.equal(calls[1].options.headers.Authorization, "token secret-token");
-    const body = JSON.parse(calls[1].options.body);
+    assert.equal(
+      calls[1].url,
+      "https://gitea.example.test/api/v1/repos/team/service/pulls/main/automation%2Fwf-123",
+    );
+    assert.equal(calls[2].url, "https://gitea.example.test/api/v1/repos/team/service/pulls");
+    assert.equal(calls[2].options.method, "POST");
+    assert.equal(calls[2].options.headers.Authorization, "token secret-token");
+    const body = JSON.parse(calls[2].options.body);
     assert.deepEqual({ ...body, body: undefined }, {
       title: "Agent changes",
-      head: "agent/work",
+      head: "automation/wf-123",
       base: "main",
       body: undefined,
     });
@@ -117,10 +127,10 @@ test("reuses a pull request with the same idempotency key", async () => {
   process.env.GITEA_ALLOWED_REPOSITORIES = "team/service";
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(
-    JSON.stringify({
+    JSON.stringify([{
       id: 9,
       body: "<!-- automation-idempotency-key: wf-123-create-pr-1 -->",
-    }),
+    }]),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
   try {
@@ -132,7 +142,7 @@ test("reuses a pull request with the same idempotency key", async () => {
         owner: "team",
         repository: "service",
         title: "Agent changes",
-        head: "agent/work",
+        head: "automation/wf-123",
         base: "main",
         workflow_id: "wf-123",
         idempotency_key: "wf-123-create-pr-1",
@@ -143,6 +153,36 @@ test("reuses a pull request with the same idempotency key", async () => {
     assert.equal(result.automation_reused, true);
   } finally {
     globalThis.fetch = originalFetch;
+    delete process.env.TEST_GITEA_URL;
+    delete process.env.TEST_GITEA_TOKEN;
+    delete process.env.GITEA_ALLOWED_REPOSITORIES;
+  }
+});
+
+test("rejects a pull request from a non-workflow branch", async () => {
+  process.env.TEST_GITEA_URL = "https://gitea.example.test";
+  process.env.TEST_GITEA_TOKEN = "secret-token";
+  process.env.GITEA_ALLOWED_REPOSITORIES = "team/service";
+  const ctx = context();
+  try {
+    apply(ctx.value, { baseUrlEnv: "TEST_GITEA_URL", tokenEnv: "TEST_GITEA_TOKEN" });
+    const create = ctx.tools.find((tool) => tool.name === "gitea_create_pull_request");
+    await assert.rejects(
+      create.execute(
+        {
+          owner: "team",
+          repository: "service",
+          title: "Agent changes",
+          head: "automation/wf-123-fix",
+          base: "main",
+          workflow_id: "wf-123",
+          idempotency_key: "wf-123-create-pr-1",
+        },
+        { signal: undefined },
+      ),
+      /head must be the stable workflow branch automation\/wf-123/u,
+    );
+  } finally {
     delete process.env.TEST_GITEA_URL;
     delete process.env.TEST_GITEA_TOKEN;
     delete process.env.GITEA_ALLOWED_REPOSITORIES;

@@ -51,7 +51,7 @@ def test_health_plugins_and_prepare_endpoints(image_resolver, tmp_path: Path, mo
     assert health["docker"] is True
     assert health["providers"]["openai"]["configured"] is False
     assert health["providers"]["openrouter"]["configured"] is False
-    assert health["default_agent"]["model"] == "openai/gpt-4.1-nano"
+    assert health["default_agent"]["model"] == "z-ai/glm-4.7-flash"
     assert health["queue"]["pending"] == 0
     assert health["queue"]["worker_online"] is False
     assert "gitea" in health["providers"]
@@ -287,6 +287,28 @@ def test_signed_gitea_webhook_is_idempotent(image_resolver, tmp_path: Path, monk
     )
     assert invalid.status_code == 422
 
+    automation_payload = json.loads(body)
+    automation_payload["ref"] = "refs/heads/automation/wf-test"
+    automation_body = json.dumps(automation_payload, separators=(",", ":")).encode()
+    automation_signature = hmac.new(
+        secret.encode(), automation_body, hashlib.sha256
+    ).hexdigest()
+    ignored = client.post(
+        "/v1/webhooks/gitea",
+        content=automation_body,
+        headers={
+            **headers,
+            "X-Gitea-Delivery": "delivery-automation",
+            "X-Gitea-Signature": automation_signature,
+        },
+    )
+    assert ignored.status_code == 202
+    assert ignored.json() == {
+        "accepted": False,
+        "reason": "automation branch push is handled by its parent workflow",
+    }
+    assert len(client.get("/v1/workflows").json()) == 1
+
 
 def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
     image_resolver, tmp_path: Path, monkeypatch
@@ -303,6 +325,7 @@ def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
     secret = "plane-webhook-secret"
     monkeypatch.setenv("PLANE_WEBHOOK_SECRET", secret)
     monkeypatch.setenv("PLANE_READY_STATE_NAMES", "Ready for development")
+    monkeypatch.setenv("PLANE_TESTING_STATE_NAMES", "Testing")
     monkeypatch.setenv(
         "PLANE_PROJECT_REPOSITORIES",
         json.dumps({"PAY": "team/service"}),
@@ -359,8 +382,29 @@ def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
         == 401
     )
 
-    payload["data"]["state_detail"] = {"id": "state-backlog", "name": "Backlog"}
+    payload["data"]["state_detail"] = {"id": "state-testing", "name": "Testing"}
     payload["data"]["updated_at"] = "2026-08-20T10:01:00Z"
+    payload["data"]["description_stripped"] = (
+        "Test the implemented retry behavior\n\n"
+        "Automation implementation ref: feature/payment-retry"
+    )
+    testing_body = json.dumps(payload).encode()
+    testing_signature = hmac.new(secret.encode(), testing_body, hashlib.sha256).hexdigest()
+    testing = client.post(
+        "/v1/webhooks/plane",
+        content=testing_body,
+        headers={**headers, "X-Plane-Signature": testing_signature},
+    )
+    assert testing.status_code == 202
+    assert testing.json()["accepted"] is True
+    assert testing.json()["workflow"]["trigger"]["event"] == "issue.testing"
+    assert testing.json()["workflow"]["trigger"]["data"]["repository"] == {
+        "full_name": "team/service",
+        "implementation_ref": "feature/payment-retry",
+    }
+
+    payload["data"]["state_detail"] = {"id": "state-backlog", "name": "Backlog"}
+    payload["data"]["updated_at"] = "2026-08-20T10:02:00Z"
     ignored_body = json.dumps(payload).encode()
     ignored_signature = hmac.new(secret.encode(), ignored_body, hashlib.sha256).hexdigest()
     ignored = client.post(
@@ -371,7 +415,7 @@ def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
     assert ignored.status_code == 202
     assert ignored.json() == {
         "accepted": False,
-        "reason": "issue is not ready for development",
+        "reason": "issue is not in an actionable state",
     }
 
 
@@ -409,7 +453,7 @@ def test_signed_gitea_review_webhook_resumes_waiting_workflow(
                 "html_url": "http://gitea/team/service/pulls/17",
                 "body": f"Changes\n\n<!-- automation-workflow: {waiting['id']} -->",
             },
-            "review": {"type": "approved", "body": "Looks good"},
+            "review": {"type": "approved", "content": "Looks good"},
         },
         separators=(",", ":"),
     ).encode()
@@ -435,7 +479,144 @@ def test_signed_gitea_review_webhook_resumes_waiting_workflow(
     assert completed["status"] == "COMPLETED"
 
 
-def test_implement_ticket_review_loop_returns_feedback_to_agent(
+def test_gitea_merge_decision_ignores_approval_and_handles_merge_or_close(
+    image_resolver, tmp_path: Path, monkeypatch
+):
+    scenario_root = tmp_path / "merge-scenarios"
+    scenario_root.mkdir()
+    (scenario_root / "merge.json").write_text(
+        json.dumps(
+            {
+                "id": "merge-decision",
+                "trigger": {"source": "manual", "event": "merge-decision"},
+                "start_step": "create-pull",
+                "steps": {
+                    "create-pull": {
+                        "type": "command",
+                        "command": "complete",
+                        "parameters": {
+                            "data": {
+                                "pull_request": {
+                                    "repository": "team/service",
+                                    "index": 17,
+                                    "url": "http://gitea/team/service/pulls/17",
+                                }
+                            }
+                        },
+                        "transitions": {"SUCCESS": "decision", "FAILURE": None},
+                    },
+                    "decision": {
+                        "type": "review",
+                        "provider": "gitea",
+                        "decision": "merge",
+                        "transitions": {"SUCCESS": "accepted", "FAILURE": "rejected"},
+                    },
+                    "accepted": {
+                        "type": "command",
+                        "command": "complete",
+                        "transitions": {"SUCCESS": None, "FAILURE": None},
+                    },
+                    "rejected": {
+                        "type": "command",
+                        "command": "fail",
+                        "transitions": {"SUCCESS": None, "FAILURE": None},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = AgentService(
+        ContextBuilder(), image_resolver, SandboxManager(tmp_path / "merge-jobs")
+    )
+    service.scenario_registry = ScenarioRegistry(scenario_root)
+    service.workflow_engine = WorkflowEngine(
+        service.scenario_registry,
+        WorkflowStore(tmp_path / "merge-workflows"),
+        service,
+    )
+    secret = "merge-webhook-secret"
+    monkeypatch.setenv("GITEA_WEBHOOK_SECRET", secret)
+    client = TestClient(create_app(service))
+
+    for sequence, merged in enumerate((True, False), start=1):
+        created = client.post(
+            "/v1/triggers",
+            json={
+                "source": "manual",
+                "event": "merge-decision",
+                "event_id": f"merge-decision-{sequence}",
+                "data": {},
+            },
+        ).json()
+        assert process_one(service, worker_id=f"merge-worker-{sequence}", heartbeat_seconds=0.01)
+        waiting = client.get(f"/v1/workflows/{created['id']}").json()
+        assert waiting["status"] == "WAITING"
+        assert waiting["pending_review"]["decision"] == "merge"
+
+        approval_body = json.dumps(
+            {
+                "action": "reviewed",
+                "repository": {"full_name": "team/service"},
+                "pull_request": {
+                    "number": 17,
+                    "body": f"<!-- automation-workflow: {waiting['id']} -->",
+                },
+                "review": {"type": "approved"},
+            },
+            separators=(",", ":"),
+        ).encode()
+        approval_signature = hmac.new(
+            secret.encode(), approval_body, hashlib.sha256
+        ).hexdigest()
+        ignored = client.post(
+            "/v1/webhooks/gitea",
+            content=approval_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Gitea-Event-Type": "pull_request_review_approved",
+                "X-Gitea-Delivery": f"merge-approval-{sequence}",
+                "X-Gitea-Signature": approval_signature,
+            },
+        )
+        assert ignored.status_code == 202
+        assert ignored.json()["status"] == "WAITING"
+
+        close_body = json.dumps(
+            {
+                "action": "closed",
+                "repository": {"full_name": "team/service"},
+                "pull_request": {
+                    "number": 17,
+                    "merged": merged,
+                    "html_url": "http://gitea/team/service/pulls/17",
+                    "body": f"<!-- automation-workflow: {waiting['id']} -->",
+                },
+            },
+            separators=(",", ":"),
+        ).encode()
+        close_signature = hmac.new(secret.encode(), close_body, hashlib.sha256).hexdigest()
+        decided = client.post(
+            "/v1/webhooks/gitea",
+            content=close_body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Gitea-Event-Type": "pull_request",
+                "X-Gitea-Delivery": f"merge-close-{sequence}",
+                "X-Gitea-Signature": close_signature,
+            },
+        )
+        assert decided.status_code == 202
+        assert decided.json()["status"] == "RUNNING"
+        assert process_one(
+            service, worker_id=f"merge-finish-{sequence}", heartbeat_seconds=0.01
+        )
+        completed = client.get(f"/v1/workflows/{waiting['id']}").json()
+        assert completed["status"] == "COMPLETED"
+        assert completed["outcome"] == ("SUCCESS" if merged else "FAILURE")
+
+
+def test_implement_ticket_produces_branch_ready_for_testing(
     image_resolver, tmp_path: Path, monkeypatch
 ):
     sandbox = SandboxManager(tmp_path / "jobs")
@@ -480,13 +661,13 @@ def test_implement_ticket_review_loop_returns_feedback_to_agent(
             outcome="SUCCESS",
             data={
                 "summary": "Changes pushed",
-                "pull_request": {
+                "implementation_change": {
                     "repository": "team/service",
-                    "index": 17,
-                    "url": "http://gitea/team/service/pulls/17",
+                    "base_ref": "main",
+                    "branch": f"automation/{request.workflow_id}",
+                    "commit": "a" * 40,
                 },
             },
-            artifacts=[],
         )
 
     monkeypatch.setattr(service, "run", run_agent)
@@ -495,6 +676,7 @@ def test_implement_ticket_review_loop_returns_feedback_to_agent(
     plane_secret = "plane-webhook-secret"
     monkeypatch.setenv("PLANE_WEBHOOK_SECRET", plane_secret)
     monkeypatch.setenv("PLANE_READY_STATE_NAMES", "Ready for development")
+    monkeypatch.setenv("PLANE_TESTING_STATE_NAMES", "Testing")
     monkeypatch.setenv(
         "PLANE_PROJECT_REPOSITORIES",
         json.dumps({"PAY": "team/service"}),
@@ -532,62 +714,38 @@ def test_implement_ticket_review_loop_returns_feedback_to_agent(
     assert plane_response.status_code == 202
     created = plane_response.json()["workflow"]
     assert process_one(service, worker_id="ticket-worker", heartbeat_seconds=0.01)
-    waiting = client.get(f"/v1/workflows/{created['id']}").json()
-    assert waiting["status"] == "WAITING"
-    assert waiting["pending_review"]["repository"] == "team/service"
-    assert waiting["pending_review"]["pull_index"] == 17
-
-    def review(event_type, delivery, review_type, comment):
-        body = json.dumps(
-            {
-                "action": "reviewed",
-                "repository": {"full_name": "team/service"},
-                "pull_request": {
-                    "number": 17,
-                    "html_url": "http://gitea/team/service/pulls/17",
-                    "body": f"<!-- automation-workflow: {waiting['id']} -->",
-                },
-                "review": {"type": review_type, "body": comment},
-            },
-            separators=(",", ":"),
-        ).encode()
-        signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-        return client.post(
-            "/v1/webhooks/gitea",
-            content=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Gitea-Event-Type": event_type,
-                "X-Gitea-Delivery": delivery,
-                "X-Gitea-Signature": signature,
-            },
-        )
-
-    rejected = review(
-        "pull_request_review_rejected",
-        "ticket-review-1",
-        "rejected",
-        "Add a regression test",
-    )
-    assert rejected.status_code == 202
-    assert rejected.json()["status"] == "RUNNING"
-    assert process_one(service, worker_id="ticket-worker", heartbeat_seconds=0.01)
-    revised = client.get(f"/v1/workflows/{waiting['id']}").json()
-    approved = review(
-        "pull_request_review_approved",
-        "ticket-review-2",
-        "approved",
-        "Approved",
-    )
-    assert approved.status_code == 202
-    assert approved.json()["status"] == "RUNNING"
-    assert process_one(service, worker_id="ticket-worker", heartbeat_seconds=0.01)
-    completed = client.get(f"/v1/workflows/{waiting['id']}").json()
-
-    assert revised["status"] == "WAITING"
-    assert revised["iterations"]["implement"] == 2
+    completed = client.get(f"/v1/workflows/{created['id']}").json()
     assert completed["status"] == "COMPLETED"
-    assert len(agent_requests) == 2
-    assert agent_requests[1].context.review_comments == ["Add a regression test"]
-    assert agent_requests[1].context.swirl_results[0]["url"] == "https://kb/A-1"
-    assert swirl.queries == ["Fix payment retry", "Fix payment retry"]
+    assert completed["executions"][-1]["data"]["plane_recommendation"] == "move_to_testing"
+    assert len(agent_requests) == 1
+    assert agent_requests[0].context.swirl_results[0]["url"] == "https://kb/A-1"
+    assert swirl.queries == ["Fix payment retry"]
+
+    plane_payload["data"]["state_detail"] = {
+        "id": "testing-state",
+        "name": "Testing",
+    }
+    plane_payload["data"]["updated_at"] = "2026-08-20T10:01:00Z"
+    testing_body = json.dumps(plane_payload).encode()
+    testing_signature = hmac.new(
+        plane_secret.encode(), testing_body, hashlib.sha256
+    ).hexdigest()
+    testing_response = client.post(
+        "/v1/webhooks/plane",
+        content=testing_body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Plane-Event": "issue",
+            "X-Plane-Delivery": "ticket-delivery-2",
+            "X-Plane-Signature": testing_signature,
+        },
+    )
+
+    assert testing_response.status_code == 202
+    source = testing_response.json()["workflow"]["trigger"]["data"]["repository"]
+    assert source == {
+        "full_name": "team/service",
+        "implementation_ref": f"automation/{created['id']}",
+        "implementation_commit": "a" * 40,
+        "implementation_workflow_id": created["id"],
+    }

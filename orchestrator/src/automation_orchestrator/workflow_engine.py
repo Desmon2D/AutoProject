@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -8,6 +9,7 @@ from typing import Any
 
 from .audit_store import AuditStore
 from .capability_registry import CapabilityResolutionError
+from .gitea_client import GiteaClient, GiteaClientError
 from .image_builder import ImageBuildError
 from .image_registry import ImageResolutionError
 from .job_store import IdempotencyConflict
@@ -15,6 +17,7 @@ from .models import (
     AgentRunRequest,
     AgentScenarioStep,
     AgentStep,
+    ArtifactRef,
     CommandScenarioStep,
     PendingRetry,
     PendingReview,
@@ -28,6 +31,7 @@ from .models import (
     WorkflowContext,
     WorkflowInstance,
 )
+from .plane_client import PlaneClient, PlaneClientError
 from .plugin_registry import PluginResolutionError
 from .sandbox_manager import SandboxExecutionError
 from .scenario_registry import ScenarioRegistry
@@ -42,6 +46,14 @@ class WorkflowExecutionError(RuntimeError):
 
 
 class CommandExecutor:
+    def __init__(
+        self,
+        gitea_client: GiteaClient | None = None,
+        plane_client: PlaneClient | None = None,
+    ):
+        self.gitea_client = gitea_client
+        self.plane_client = plane_client
+
     def execute(
         self,
         *,
@@ -51,9 +63,117 @@ class CommandExecutor:
         attempt: int,
         step: CommandScenarioStep,
     ) -> StepResult:
-        if step.command not in {"complete", "fail", "store_failure_report"}:
+        if step.command not in {
+            "complete",
+            "fail",
+            "store_failure_report",
+            "allow_test_rewrite",
+            "classify_test_run",
+            "create_final_pull_request",
+            "sync_plane_issue",
+        }:
             raise WorkflowExecutionError(f"command is not allowlisted: {step.command}")
-        if step.command == "store_failure_report":
+        artifacts: list[ArtifactRef] = []
+        if step.command == "sync_plane_issue":
+            if self.plane_client is None:
+                plane_sync = {"configured": False}
+            else:
+                recommendation = step.parameters.get("recommendation")
+                if not isinstance(recommendation, str):
+                    raise WorkflowExecutionError("sync_plane_issue requires recommendation")
+                ticket = workflow.trigger.data.get("ticket")
+                project = workflow.trigger.data.get("project")
+                issue_id = ticket.get("id") if isinstance(ticket, dict) else None
+                project_id = project.get("id") if isinstance(project, dict) else None
+                if not isinstance(project_id, str) and isinstance(project, dict):
+                    references = project.get("references")
+                    project_id = next(
+                        (item for item in references if isinstance(item, str)),
+                        None,
+                    ) if isinstance(references, list) else None
+                if not isinstance(issue_id, str) or not isinstance(project_id, str):
+                    raise WorkflowExecutionError("Plane issue and project ids are required")
+                details: dict[str, Any] = {}
+                for key in ("implementation_change", "test_report", "pull_request"):
+                    value = next(
+                        (
+                            execution.data.get(key)
+                            for execution in reversed(workflow.executions)
+                            if isinstance(execution.data.get(key), dict)
+                        ),
+                        None,
+                    )
+                    if isinstance(value, dict):
+                        details[key] = value
+                try:
+                    plane_sync = self.plane_client.record_result(
+                        project_id=project_id,
+                        issue_id=issue_id,
+                        workflow_id=workflow.id,
+                        recommendation=recommendation,
+                        summary=str(step.parameters.get("summary", recommendation)),
+                        details=details,
+                    )
+                except PlaneClientError as exc:
+                    raise WorkflowExecutionError(str(exc)) from exc
+            outcome = "SUCCESS"
+            data = {"plane_sync": plane_sync}
+            default_summary = "Plane issue synchronized"
+        elif step.command == "create_final_pull_request":
+            if self.gitea_client is None:
+                raise WorkflowExecutionError("Gitea client is not configured")
+            authored = next(
+                (
+                    result.data.get("test_change")
+                    for result in reversed(workflow.executions)
+                    if result.step_id == step.parameters.get("author_step", "write-tests")
+                    and result.execution_status == "COMPLETED"
+                    and result.outcome == "SUCCESS"
+                    and isinstance(result.data.get("test_change"), dict)
+                ),
+                None,
+            )
+            executed = next(
+                (
+                    result.data.get("test_report")
+                    for result in reversed(workflow.executions)
+                    if result.step_id == step.parameters.get("executor_step", "execute-tests")
+                    and result.execution_status == "COMPLETED"
+                    and result.outcome == "SUCCESS"
+                    and isinstance(result.data.get("test_report"), dict)
+                ),
+                None,
+            )
+            if not isinstance(authored, dict) or not isinstance(executed, dict):
+                raise WorkflowExecutionError("validated test change and execution report are required")
+            if executed.get("verdict") != "PASSED" or any(
+                executed.get(field) != authored.get(field)
+                for field in ("repository", "branch", "commit")
+            ):
+                raise WorkflowExecutionError("only the exact passing test commit may be proposed")
+            ticket = workflow.trigger.data.get("ticket")
+            title = ticket.get("summary") if isinstance(ticket, dict) else None
+            try:
+                pull = self.gitea_client.create_final_pull_request(
+                    repository=authored["repository"],
+                    head=authored["branch"],
+                    commit=authored["commit"],
+                    workflow_id=workflow.id,
+                    title=str(title or f"Validated changes for {workflow.id}"),
+                )
+            except (GiteaClientError, KeyError) as exc:
+                raise WorkflowExecutionError(str(exc)) from exc
+            outcome = "SUCCESS"
+            data = {"pull_request": pull, "test_report": executed}
+            default_summary = "Final pull request created after successful tests"
+            artifacts = [
+                ArtifactRef(
+                    type="pull_request",
+                    uri=pull["url"],
+                    summary="Final validated pull request",
+                )
+            ]
+        elif step.command == "store_failure_report":
             failed = next(
                 (result for result in reversed(workflow.executions) if result.outcome == "FAILURE"),
                 None,
@@ -71,6 +191,59 @@ class CommandExecutor:
                 if failed
                 else "No failed step result is available"
             )
+        elif step.command == "allow_test_rewrite":
+            author_step = step.parameters.get("author_step")
+            max_iterations = step.parameters.get("max_iterations")
+            if not isinstance(author_step, str) or not author_step:
+                raise WorkflowExecutionError("allow_test_rewrite requires author_step")
+            if type(max_iterations) is not int or not 1 <= max_iterations <= 10:
+                raise WorkflowExecutionError(
+                    "allow_test_rewrite max_iterations must be an integer from 1 to 10"
+                )
+            authored = sum(
+                result.step_id == author_step
+                and result.execution_status == "COMPLETED"
+                and result.outcome == "SUCCESS"
+                for result in workflow.executions
+            )
+            outcome = "SUCCESS" if authored < max_iterations else "FAILURE"
+            data = {
+                "author_step": author_step,
+                "completed_iterations": authored,
+                "max_iterations": max_iterations,
+            }
+            default_summary = (
+                "Test author may repair invalid test code"
+                if outcome == "SUCCESS"
+                else "Test rewrite limit reached"
+            )
+        elif step.command == "classify_test_run":
+            executor_step = step.parameters.get("executor_step")
+            if not isinstance(executor_step, str) or not executor_step:
+                raise WorkflowExecutionError("classify_test_run requires executor_step")
+            executed = next(
+                (
+                    result
+                    for result in reversed(workflow.executions)
+                    if result.step_id == executor_step
+                    and result.execution_status == "COMPLETED"
+                    and result.outcome == "SUCCESS"
+                ),
+                None,
+            )
+            report = executed.data.get("test_report") if executed else None
+            if not isinstance(report, dict):
+                raise WorkflowExecutionError("no successful test execution report is available")
+            verdict = report.get("verdict")
+            if verdict not in {"PASSED", "PRODUCT_FAILURE"}:
+                raise WorkflowExecutionError("test execution report has no final verdict")
+            outcome = "SUCCESS" if verdict == "PASSED" else "FAILURE"
+            data = {"test_report": report}
+            default_summary = (
+                "All authored tests passed"
+                if outcome == "SUCCESS"
+                else "Authored tests found a product defect"
+            )
         else:
             outcome = "SUCCESS" if step.command == "complete" else "FAILURE"
             data = step.parameters.get("data", {})
@@ -86,7 +259,7 @@ class CommandExecutor:
             execution_status="COMPLETED",
             outcome=outcome,
             data={"summary": summary, **data},
-            artifacts=[],
+            artifacts=artifacts,
         )
 
     @staticmethod
@@ -143,6 +316,102 @@ class WorkflowEngine:
                 {"scenario_id": scenario.id, "source": event.source, "event": event.event},
             )
         return workflow, True
+
+    def attach_plane_implementation(self, event: TriggerEvent) -> TriggerEvent:
+        """Attach the exact implementation produced earlier for the same Plane issue."""
+        if event.source != "plane" or event.event != "issue.testing":
+            return event
+        ticket = event.data.get("ticket")
+        repository_data = event.data.get("repository")
+        ticket_id = ticket.get("id") if isinstance(ticket, dict) else None
+        repository = (
+            repository_data.get("full_name") if isinstance(repository_data, dict) else None
+        )
+        supplied_ref = (
+            repository_data.get("implementation_ref")
+            if isinstance(repository_data, dict)
+            else None
+        )
+        if not isinstance(ticket_id, str) or not isinstance(repository, str):
+            raise WorkflowExecutionError("testing event has no Plane issue or repository")
+
+        enriched_event = event
+        plane_client = self.command_executor.plane_client
+        if supplied_ref is None and plane_client is not None:
+            project = event.data.get("project")
+            project_id = project.get("id") if isinstance(project, dict) else None
+            if not isinstance(project_id, str) and isinstance(project, dict):
+                references = project.get("references")
+                project_id = (
+                    next((item for item in references if isinstance(item, str)), None)
+                    if isinstance(references, list)
+                    else None
+                )
+            if isinstance(project_id, str):
+                try:
+                    source = plane_client.get_implementation_source(
+                        project_id=project_id,
+                        issue_id=ticket_id,
+                    )
+                except PlaneClientError as exc:
+                    raise WorkflowExecutionError(str(exc)) from exc
+                if source is not None:
+                    enriched_event = event.model_copy(deep=True)
+                    enriched_event.data["repository"].update(source)
+                    repository_data = enriched_event.data["repository"]
+                    supplied_ref = source["implementation_ref"]
+
+        for workflow in self.store.list():
+            source_ticket = workflow.trigger.data.get("ticket")
+            source_repository = workflow.trigger.data.get("repository")
+            if (
+                workflow.scenario_id != "implement-ticket"
+                or workflow.status != "COMPLETED"
+                or workflow.outcome != "SUCCESS"
+                or not isinstance(source_ticket, dict)
+                or source_ticket.get("id") != ticket_id
+                or not isinstance(source_repository, dict)
+                or source_repository.get("full_name") != repository
+            ):
+                continue
+            change = next(
+                (
+                    execution.data.get("implementation_change")
+                    for execution in reversed(workflow.executions)
+                    if execution.execution_status == "COMPLETED"
+                    and execution.outcome == "SUCCESS"
+                    and isinstance(execution.data.get("implementation_change"), dict)
+                ),
+                None,
+            )
+            if not isinstance(change, dict):
+                continue
+            branch = change.get("branch")
+            commit = change.get("commit")
+            if (
+                change.get("repository") != repository
+                or not isinstance(branch, str)
+                or not branch
+                or not isinstance(commit, str)
+                or re.fullmatch(r"[0-9a-fA-F]{40}", commit) is None
+            ):
+                continue
+            if supplied_ref is not None and supplied_ref != branch:
+                raise WorkflowExecutionError(
+                    "Plane implementation ref does not match the completed implementation workflow"
+                )
+            enriched = enriched_event.model_copy(deep=True)
+            enriched_repository = enriched.data["repository"]
+            enriched_repository["implementation_ref"] = branch
+            enriched_repository["implementation_commit"] = commit.lower()
+            enriched_repository["implementation_workflow_id"] = workflow.id
+            return enriched
+
+        if supplied_ref is not None:
+            return enriched_event
+        raise WorkflowExecutionError(
+            "no completed implementation workflow was found for this Plane issue"
+        )
 
     def start(self, event: TriggerEvent) -> WorkflowInstance:
         workflow, created = self.create(event)
@@ -222,6 +491,7 @@ class WorkflowEngine:
                     execution_id=execution.execution_id,
                     iteration=iteration,
                     provider=step.provider,
+                    decision=step.decision,
                     **review_ref,
                 )
                 return self._save(workflow)
@@ -595,7 +865,15 @@ class WorkflowEngine:
                 ),
                 context=self._context(workflow, step),
             )
-            return self.agent_service.run(request)
+            result = self.agent_service.run(request)
+            return self._validate_agent_result(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                step,
+                result,
+            )
         except (
             CapabilityResolutionError,
             IdempotencyConflict,
@@ -609,6 +887,320 @@ class WorkflowEngine:
             return self._technical_error(
                 workflow, step_id, iteration, attempt, "AGENT_EXECUTION_ERROR", str(exc)
             )
+
+    def _validate_agent_result(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        step: AgentScenarioStep,
+        result: StepResult,
+    ) -> StepResult:
+        if result.execution_status != "COMPLETED":
+            return result
+        if step.result_contract == "test_execution":
+            return self._validate_test_execution_result(
+                workflow, step_id, iteration, attempt, result
+            )
+        if result.outcome != "SUCCESS":
+            return result
+        if step.result_contract == "test_change":
+            return self._validate_test_change_result(
+                workflow, step_id, iteration, attempt, result
+            )
+        if step.result_contract == "implementation_change":
+            return self._validate_implementation_change_result(
+                workflow, step_id, iteration, attempt, result
+            )
+        next_step_id = step.transitions.get("SUCCESS")
+        if next_step_id is None:
+            return result
+        scenario = self.scenarios.get(workflow.scenario_id)
+        if step.result_contract != "pull_request" and not isinstance(
+            scenario.steps[next_step_id], ReviewScenarioStep
+        ):
+            return result
+
+        pull = result.data.get("pull_request")
+        if not isinstance(pull, dict):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_RESULT_PULL_REQUEST_INVALID",
+                "successful implementation must return data.pull_request",
+            )
+        repository = pull.get("repository")
+        index = pull.get("index")
+        url = pull.get("url") or pull.get("html_url")
+        if (
+            not isinstance(repository, str)
+            or not repository.strip()
+            or not isinstance(index, int)
+            or index < 1
+            or not isinstance(url, str)
+            or not url.startswith(("http://", "https://"))
+        ):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_RESULT_PULL_REQUEST_INVALID",
+                "data.pull_request must contain repository, positive index, and HTTP URL",
+            )
+        if not any(
+            artifact.type == "pull_request" and artifact.uri == url
+            for artifact in result.artifacts
+        ):
+            result = result.model_copy(
+                update={
+                    "artifacts": [
+                        *result.artifacts,
+                        ArtifactRef(
+                            type="pull_request",
+                            uri=url,
+                            summary="Pull request returned by the implementation agent",
+                        ),
+                    ]
+                }
+            )
+
+        expected = self._review_reference(workflow)
+        expected_repository = expected.get("repository")
+        expected_index = expected.get("pull_index")
+        if expected_repository is not None and expected_repository != repository:
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_PULL_REQUEST_CHANGED",
+                "implementation iteration changed the reviewed repository",
+            )
+        if expected_index is not None and expected_index != index:
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_PULL_REQUEST_CHANGED",
+                "implementation iteration created a different pull request",
+            )
+        return result
+
+    def _validate_implementation_change_result(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        result: StepResult,
+    ) -> StepResult:
+        change = result.data.get("implementation_change")
+        repository_data = workflow.trigger.data.get("repository")
+        expected_repository = (
+            repository_data.get("full_name") if isinstance(repository_data, dict) else None
+        )
+        if not isinstance(change, dict):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_IMPLEMENTATION_CHANGE_INVALID",
+                "successful implementation must return data.implementation_change",
+            )
+        if (
+            change.get("repository") != expected_repository
+            or change.get("branch") != f"automation/{workflow.id}"
+            or not isinstance(change.get("base_ref"), str)
+            or not change["base_ref"].strip()
+            or not isinstance(change.get("commit"), str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", change["commit"]) is None
+        ):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_IMPLEMENTATION_CHANGE_INVALID",
+                "implementation change must identify repository, base ref, stable branch, and commit",
+            )
+        gitea_client = self.command_executor.gitea_client
+        if gitea_client is not None:
+            try:
+                gitea_client.verify_branch(
+                    repository=change["repository"],
+                    branch=change["branch"],
+                    commit=change["commit"],
+                )
+            except GiteaClientError as exc:
+                return self._technical_error(
+                    workflow,
+                    step_id,
+                    iteration,
+                    attempt,
+                    "AGENT_IMPLEMENTATION_BRANCH_UNAVAILABLE",
+                    str(exc),
+                )
+        return result
+
+    def _validate_test_change_result(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        result: StepResult,
+    ) -> StepResult:
+        change = result.data.get("test_change")
+        if not isinstance(change, dict):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_TEST_CHANGE_INVALID",
+                "successful test authoring must return data.test_change",
+            )
+        repository = change.get("repository")
+        base_ref = change.get("base_ref")
+        branch = change.get("branch")
+        commit = change.get("commit")
+        repository_data = workflow.trigger.data.get("repository")
+        expected_repository = (
+            repository_data.get("full_name") if isinstance(repository_data, dict) else None
+        )
+        expected_base_ref = (
+            repository_data.get("implementation_ref")
+            if isinstance(repository_data, dict)
+            else None
+        )
+        expected_branch = f"automation/{workflow.id}"
+        if (
+            not isinstance(repository, str)
+            or repository != expected_repository
+            or not isinstance(base_ref, str)
+            or base_ref != expected_base_ref
+            or branch != expected_branch
+            or not isinstance(commit, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", commit) is None
+        ):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_TEST_CHANGE_INVALID",
+                "data.test_change must identify the mapped repository, implementation ref, stable branch, and commit",
+            )
+        gitea_client = self.command_executor.gitea_client
+        if gitea_client is not None:
+            try:
+                gitea_client.verify_branch(
+                    repository=repository,
+                    branch=branch,
+                    commit=commit,
+                )
+            except GiteaClientError as exc:
+                return self._technical_error(
+                    workflow,
+                    step_id,
+                    iteration,
+                    attempt,
+                    "AGENT_TEST_BRANCH_UNAVAILABLE",
+                    str(exc),
+                )
+        return result
+
+    def _validate_test_execution_result(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        result: StepResult,
+    ) -> StepResult:
+        report = result.data.get("test_report")
+        authored = next(
+            (
+                execution.data.get("test_change")
+                for execution in reversed(workflow.executions)
+                if execution.step_id == "write-tests"
+                and execution.execution_status == "COMPLETED"
+                and execution.outcome == "SUCCESS"
+                and isinstance(execution.data.get("test_change"), dict)
+            ),
+            None,
+        )
+        if not isinstance(report, dict) or not isinstance(authored, dict):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_TEST_REPORT_INVALID",
+                "test executor must return data.test_report for the authored test change",
+            )
+        verdict = report.get("verdict")
+        command = report.get("command")
+        exit_code = report.get("exit_code")
+        passed = report.get("passed")
+        failed = report.get("failed")
+        summary = report.get("summary")
+        same_revision = all(
+            report.get(field) == authored.get(field)
+            for field in ("repository", "branch", "commit")
+        )
+        if (
+            verdict not in {"PASSED", "PRODUCT_FAILURE", "TEST_CODE_ERROR"}
+            or not isinstance(command, str)
+            or not command.strip()
+            or type(exit_code) is not int
+            or type(passed) is not int
+            or passed < 0
+            or type(failed) is not int
+            or failed < 0
+            or not isinstance(summary, str)
+            or not summary.strip()
+            or not same_revision
+        ):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_TEST_REPORT_INVALID",
+                "data.test_report has invalid fields or does not match the authored commit",
+            )
+        valid_outcome = (
+            verdict == "PASSED"
+            and result.outcome == "SUCCESS"
+            and exit_code == 0
+            and passed > 0
+            and failed == 0
+        ) or (
+            verdict == "PRODUCT_FAILURE"
+            and result.outcome == "SUCCESS"
+            and exit_code != 0
+            and failed > 0
+        ) or (
+            verdict == "TEST_CODE_ERROR"
+            and result.outcome == "FAILURE"
+        )
+        if not valid_outcome:
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_TEST_VERDICT_INVALID",
+                "test verdict, outcome, exit code, and counters are inconsistent",
+            )
+        return result
 
     def _context(self, workflow: WorkflowInstance, step: AgentScenarioStep) -> WorkflowContext:
         swirl_results: list[dict[str, Any]] = []

@@ -387,6 +387,13 @@ class AgentScenarioStep(ScenarioStepBase):
     model: str = Field(min_length=1, max_length=200)
     timeout_seconds: int = Field(default=600, ge=1, le=3600)
     context_search: SwirlContextSearch | None = None
+    result_contract: Literal[
+        "none",
+        "pull_request",
+        "implementation_change",
+        "test_change",
+        "test_execution",
+    ] = "none"
 
     @field_validator("plugins")
     @classmethod
@@ -407,6 +414,7 @@ class CommandScenarioStep(ScenarioStepBase):
 class ReviewScenarioStep(ScenarioStepBase):
     type: Literal["review"]
     provider: Literal["gitea"] = "gitea"
+    decision: Literal["review", "merge"] = "review"
 
 
 ScenarioStep = Annotated[
@@ -462,11 +470,17 @@ class TriggerEvent(StrictModel):
         return value
 
 
+class IgnoredWebhook(StrictModel):
+    accepted: Literal[False] = False
+    reason: str = Field(min_length=1, max_length=1000)
+
+
 class PendingReview(StrictModel):
     step_id: str
     execution_id: str
     iteration: int
     provider: Literal["gitea"] = "gitea"
+    decision: Literal["review", "merge"] = "review"
     repository: str | None = Field(default=None, max_length=300)
     pull_index: int | None = Field(default=None, ge=1)
     url: str | None = Field(default=None, max_length=4000)
