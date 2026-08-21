@@ -31,7 +31,8 @@ finally {
     & $docker rm --force $builder 2>$null | Out-Null
 }
 
-& $docker build --network none --file (Join-Path $PSScriptRoot "..\Dockerfile.offline") --tag $Image (Join-Path $PSScriptRoot "..")
+$repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+& $docker build --network none --file (Join-Path $repositoryRoot "sandbox\Dockerfile.offline") --tag $Image $repositoryRoot
 if ($LASTEXITCODE -ne 0) {
     throw "Offline Docker build failed with exit code $LASTEXITCODE"
 }

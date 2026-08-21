@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $envFile = Join-Path $root ".env"
 
 function Set-DotEnvValue([string]$Name, [string]$Value) {
@@ -62,7 +62,7 @@ finally {
 }
 
 if (-not $SkipSmoke) {
-    & (Join-Path $PSScriptRoot "openrouter-smoke.ps1") `
+    & (Join-Path $PSScriptRoot "..\smoke\openrouter-smoke.ps1") `
         -Model $Model `
         -SkipBuild:$SkipBuild
 }

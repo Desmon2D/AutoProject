@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $envFile = Join-Path $root ".env"
 
 function Get-DotEnvValue([string]$Name) {
@@ -32,7 +32,7 @@ function Expand-ResponseItems($Value) {
 $adminEmail = Get-DotEnvValue "PLANE_ADMIN_EMAIL"
 $adminPassword = Get-DotEnvValue "PLANE_ADMIN_PASSWORD"
 if ([string]::IsNullOrWhiteSpace($adminEmail) -or [string]::IsNullOrWhiteSpace($adminPassword)) {
-    throw "Run .\scripts\start-dev-plane.ps1 first"
+    throw "Run .\scripts\dev\start-dev-plane.ps1 first"
 }
 
 $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
@@ -122,4 +122,4 @@ if ($null -eq $workflow) {
 Write-Output "Plane ticket created: $ProjectIdentifier-$($issue.sequence_id)"
 Write-Output "Workflow queued: $($workflow.id) ($($workflow.status))"
 Write-Output "Continue in low-memory execution mode:"
-Write-Output "  .\scripts\start-low-memory.ps1 -WithGitea"
+Write-Output "  .\scripts\dev\start-low-memory.ps1 -WithGitea"

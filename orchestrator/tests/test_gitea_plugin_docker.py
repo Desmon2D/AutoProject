@@ -20,7 +20,7 @@ def test_builds_and_loads_production_gitea_plugin():
     root = Path(__file__).parents[1]
     plugins = PluginRegistry(root / "plugins")
     selected = plugins.resolve(["step-result", "gitea"]).plugins
-    images = ImageRegistry(root / "images", CapabilityRegistry(root / "capabilities"))
+    images = ImageRegistry(root / "image-catalog", CapabilityRegistry(root / "capabilities"))
     spec = images.resolve(capabilities=["git"], plugins=selected)
     client = docker.from_env()
 

@@ -24,7 +24,7 @@ def build_service() -> AgentService:
     plugin_root = Path(os.environ.get("PLUGIN_ROOT", "/app/plugins"))
     skill_root = Path(os.environ.get("SKILL_ROOT", "/app/skills"))
     capability_root = Path(os.environ.get("CAPABILITY_ROOT", "/app/capabilities"))
-    image_root = Path(os.environ.get("IMAGE_ROOT", "/app/images"))
+    image_root = Path(os.environ.get("IMAGE_ROOT", "/app/image-catalog"))
     scenario_root = Path(os.environ.get("SCENARIO_ROOT", "/app/scenarios"))
     jobs_root = Path(os.environ.get("JOBS_ROOT", "/data/jobs"))
     queue_path = Path(

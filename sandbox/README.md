@@ -39,7 +39,7 @@ $env:OPENAI_API_KEY = "..."
 The complete OpenRouter smoke check is launched from the repository root:
 
 ```powershell
-.\scripts\configure-openrouter.ps1
+.\scripts\setup\configure-openrouter.ps1
 ```
 
 `run.ps1` uses Docker's default DNS. Pass `-DnsServer "1.1.1.1"` or a corporate

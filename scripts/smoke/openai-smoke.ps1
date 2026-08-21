@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $docker = "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"
 if (-not (Test-Path -LiteralPath $docker)) {
     throw "Docker CLI not found: $docker"

@@ -5,7 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
+$smokeScripts = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\smoke")).Path
 $compose = Join-Path $root "compose.yaml"
 $envFile = Join-Path $root ".env"
 $docker = "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin\docker.exe"
@@ -117,7 +118,7 @@ for ($attempt = 1; $attempt -le 30; $attempt++) {
 }
 if (-not $orchestratorReady) { throw "Orchestrator did not become healthy" }
 if (-not $orchestratorHealth.providers.openrouter.configured) {
-    throw "OpenRouter is not configured; run scripts/configure-openrouter.ps1 first"
+    throw "OpenRouter is not configured; run scripts/setup/configure-openrouter.ps1 first"
 }
 
 $apiHeaders = @{ Authorization = "token $token" }
@@ -165,7 +166,7 @@ $workflowIdsBefore = @($workflowResponse | ForEach-Object { $_.id })
     --env "GITEA_TOKEN=$token" `
     --env "GITEA_USERNAME=$Username" `
     --env "GITEA_REPOSITORY=$Repository" `
-    --volume "${PSScriptRoot}:/bootstrap:ro" `
+    --volume "${smokeScripts}:/bootstrap:ro" `
     --entrypoint sh `
     automation-dsh-sandbox-code:0.1.0-rc.7 `
     /bootstrap/check-dev-gitea.sh

@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PLUGIN_ROOT=/app/plugins \
     SKILL_ROOT=/app/skills \
     CAPABILITY_ROOT=/app/capabilities \
-    IMAGE_ROOT=/app/images \
+    IMAGE_ROOT=/app/image-catalog \
     SCENARIO_ROOT=/app/scenarios \
     JOBS_ROOT=/data/jobs
 
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir --no-deps --editable .
 COPY plugins ./plugins
 COPY skills ./skills
 COPY capabilities ./capabilities
-COPY images ./images
+COPY image-catalog ./image-catalog
 COPY scenarios ./scenarios
 COPY tests ./tests
 

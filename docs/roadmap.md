@@ -1,19 +1,19 @@
 # План реализации по подсистемам
 
-Единственный источник требований — [полное описание архитектуры](./00_full_agent_architecture.md). Дополнительные планы только распределяют эти требования по соответствующим частям проекта.
+Единственный источник требований — [полное описание архитектуры](./architecture.md). Дополнительные планы только распределяют эти требования по соответствующим частям проекта.
 
 ## Подсистемы
 
 | Подсистема | Требования | Локальный план |
 |---|---|---|
-| Оркестратор | Монолитное приложение с внутренними логическими модулями | [orchestrator/PLAN.md](./orchestrator/PLAN.md) |
-| Сценарии | JSON-граф шагов `command`, `agent`, `review` | [orchestrator/scenarios/PLAN.md](./orchestrator/scenarios/PLAN.md) |
-| Образы агентов | Выбор готового образа по списку расширений или сборка и кеширование нового | [orchestrator/images/PLAN.md](./orchestrator/images/PLAN.md) |
-| Расширения | Дополнительные возможности агента внутри его образа | [orchestrator/plugins/PLAN.md](./orchestrator/plugins/PLAN.md) |
-| Gitea | Создание и проверка запросов на слияние | [orchestrator/plugins/gitea/PLAN.md](./orchestrator/plugins/gitea/PLAN.md) |
-| SWIRL | Федеративный поиск по корпоративным источникам | [orchestrator/plugins/swirl/PLAN.md](./orchestrator/plugins/swirl/PLAN.md) |
-| Песочница | Отдельный Docker-контейнер для каждого запуска агента | [sandbox/PLAN.md](./sandbox/PLAN.md) |
-| Панель состояния | Отображение состояния выполнения | [dashboard/PLAN.md](./dashboard/PLAN.md) |
+| Оркестратор | Монолитное приложение с внутренними логическими модулями | [components/orchestrator.md](./components/orchestrator.md) |
+| Сценарии | JSON-граф шагов `command`, `agent`, `review` | [components/scenarios.md](./components/scenarios.md) |
+| Образы агентов | Выбор готового образа по списку расширений или сборка и кеширование нового | [components/images.md](./components/images.md) |
+| Расширения | Дополнительные возможности агента внутри его образа | [components/plugins.md](./components/plugins.md) |
+| Gitea | Создание и проверка запросов на слияние | [plugins/gitea.md](./plugins/gitea.md) |
+| SWIRL | Федеративный поиск по корпоративным источникам | [plugins/swirl.md](./plugins/swirl.md) |
+| Песочница | Отдельный Docker-контейнер для каждого запуска агента | [components/sandbox.md](./components/sandbox.md) |
+| Панель состояния | Отображение состояния выполнения | [components/dashboard.md](./components/dashboard.md) |
 
 ## Архитектурные правила
 
@@ -42,7 +42,7 @@
 - Gitea запускается по требованию отдельным профилем. Для сценария с запросом на слияние её можно добавить к малоресурсному режиму.
 - Полный SWIRL и Redis запускаются только для отдельной проверки интеграции и не должны постоянно работать на машине с малым объёмом памяти.
 - Лёгкий поиск является только средством разработки: он сохраняет программный договор SWIRL, но не заменяет его федеративный поиск в целевой среде.
-- Команда основного режима: `./scripts/start-low-memory.ps1`. Ключ `-WithGitea` добавляет Gitea, ключ `-CoreOnly` отключает даже лёгкий поиск.
+- Команда основного режима: `./scripts/dev/start-low-memory.ps1`. Ключ `-WithGitea` добавляет Gitea, ключ `-CoreOnly` отключает даже лёгкий поиск.
 
 ## Текущее состояние
 
