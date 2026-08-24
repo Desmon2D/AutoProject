@@ -67,6 +67,8 @@ Set-DotEnvValue "PLANE_BASE_URL" "http://plane"
 Set-DotEnvValue "PLANE_WORKSPACE_SLUG" "automation"
 Set-DotEnvValue "PLANE_WEBHOOK_SECRET" $webhookSecret
 Set-DotEnvValue "PLANE_READY_STATE_NAMES" "Ready for development"
+Set-DotEnvValue "PLANE_IN_DEVELOPMENT_STATE_NAMES" "In development"
+Set-DotEnvValue "PLANE_DEVELOPMENT_REVIEW_STATE_NAMES" "Development review"
 Set-DotEnvValue "PLANE_TESTING_STATE_NAMES" "Testing"
 Set-DotEnvValue "PLANE_ADMIN_EMAIL" $adminEmail
 Set-DotEnvValue "PLANE_ADMIN_PASSWORD" $adminPassword
@@ -300,6 +302,42 @@ if ($null -eq $readyState) {
         -TimeoutSec 30
 }
 Set-DotEnvValue "PLANE_READY_STATE_IDS" $readyState.id
+$inDevelopmentState = $states | Where-Object { $_.name -eq "In development" } | Select-Object -First 1
+if ($null -eq $inDevelopmentState) {
+    $inDevelopmentState = Invoke-RestMethod `
+        -Method Post `
+        -Uri $stateUrl `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{
+            name = "In development"
+            color = "#2563EB"
+            group = "started"
+            description = "Implementation is running"
+            sequence = 75000
+        } | ConvertTo-Json -Compress) `
+        -WebSession $session `
+        -TimeoutSec 30
+}
+Set-DotEnvValue "PLANE_IN_DEVELOPMENT_STATE_IDS" $inDevelopmentState.id
+$developmentReviewState = $states | Where-Object { $_.name -eq "Development review" } | Select-Object -First 1
+if ($null -eq $developmentReviewState) {
+    $developmentReviewState = Invoke-RestMethod `
+        -Method Post `
+        -Uri $stateUrl `
+        -Headers $headers `
+        -ContentType "application/json" `
+        -Body (@{
+            name = "Development review"
+            color = "#8B5CF6"
+            group = "started"
+            description = "Implementation branch is waiting for a human decision"
+            sequence = 80000
+        } | ConvertTo-Json -Compress) `
+        -WebSession $session `
+        -TimeoutSec 30
+}
+Set-DotEnvValue "PLANE_DEVELOPMENT_REVIEW_STATE_IDS" $developmentReviewState.id
 $testingState = $states | Where-Object { $_.name -eq "Testing" } | Select-Object -First 1
 if ($null -eq $testingState) {
     $testingState = Invoke-RestMethod `

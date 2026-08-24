@@ -17,6 +17,7 @@ from .scenario_registry import ScenarioRegistry
 from .service import AgentService
 from .skill_registry import SkillRegistry
 from .swirl_client import SwirlClient
+from .test_runner import DockerTestRunner
 from .workflow_engine import CommandExecutor, WorkflowEngine
 from .workflow_queue import WorkflowQueue
 from .workflow_store import WorkflowStore
@@ -76,6 +77,13 @@ def build_service() -> AgentService:
         command_executor=CommandExecutor(
             GiteaClient.from_environment(),
             PlaneClient.from_environment(),
+            DockerTestRunner(
+                os.environ.get(
+                    "TEST_RUNNER_IMAGE",
+                    "automation-dsh-sandbox-delivery:0.1.0-rc.7",
+                ),
+                timeout_seconds=int(os.environ.get("TEST_RUNNER_TIMEOUT_SECONDS", "900")),
+            ),
         ),
         swirl_client=SwirlClient.from_environment(),
         audit_store=service.audit_store,

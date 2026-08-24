@@ -8,16 +8,19 @@ from fastapi.testclient import TestClient
 from automation_orchestrator.api import create_app
 from automation_orchestrator.context_builder import ContextBuilder
 from automation_orchestrator.models import (
+    PendingReview,
     StepError,
     StepResult,
     SwirlSearchResponse,
     SwirlSearchResult,
+    TriggerEvent,
+    WorkflowInstance,
 )
 from automation_orchestrator.sandbox_manager import SandboxManager
 from automation_orchestrator.scenario_registry import ScenarioRegistry
 from automation_orchestrator.service import AgentService
 from automation_orchestrator.worker import process_one
-from automation_orchestrator.workflow_engine import WorkflowEngine
+from automation_orchestrator.workflow_engine import CommandExecutor, WorkflowEngine
 from automation_orchestrator.workflow_store import WorkflowStore
 
 
@@ -110,6 +113,118 @@ def test_trigger_and_review_workflow_endpoints(image_resolver, tmp_path: Path):
     assert completed.json()["status"] == "COMPLETED"
 
 
+def test_analysis_request_produces_downloadable_markdown(
+    image_resolver, tmp_path: Path, monkeypatch
+):
+    jobs_root = tmp_path / "jobs"
+    sandbox = SandboxManager(jobs_root)
+    service = AgentService(ContextBuilder(), image_resolver, sandbox)
+    service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+
+    class StubSwirl:
+        def search(self, query, **_kwargs):
+            assert query == "Изучи документацию и составь требования"
+            return SwirlSearchResponse(
+                query=query,
+                results=[
+                    SwirlSearchResult(
+                        title="Процесс обработки заявок",
+                        snippet="Заявка проходит проверку и согласование.",
+                        url="https://kb.example/process",
+                        source="bookstack",
+                        document_id="17",
+                    )
+                ],
+            )
+
+        def fetch_document(self, result, **_kwargs):
+            return result.model_copy(
+                update={
+                    "content": "# Source\n\nFull process documentation.",
+                    "content_format": "markdown",
+                }
+            )
+
+    service.workflow_engine = WorkflowEngine(
+        service.scenario_registry,
+        WorkflowStore(tmp_path / "workflows"),
+        service,
+        swirl_client=StubSwirl(),
+    )
+
+    def run_agent(request):
+        assert request.step.model == "openai/gpt-4.1"
+        assert "query-ranked sections selected from full source text" in request.step.prompt
+        assert request.context.swirl_results[0]["source"] == "bookstack"
+        assert request.context.swirl_results[0]["content_format"] == "markdown"
+        assert request.context.swirl_results[0]["content"] is None
+        assert request.context.swirl_results[0]["excerpts"]
+        output = jobs_root / request.execution_id / "output"
+        output.mkdir(parents=True)
+        output.joinpath("analysis.md").write_text(
+            "# Требования к обработке заявок\n\n"
+            "## Назначение\n\nСистема должна поддерживать проверку и согласование заявок.\n\n"
+            "## Требования\n\n1. Каждая заявка проходит проверку.\n"
+            "2. Результат согласования сохраняется.\n\n"
+            "## Источники\n\n- [Процесс обработки заявок](https://kb.example/process)\n",
+            encoding="utf-8",
+        )
+        return StepResult(
+            step_id=request.step.id,
+            execution_id=request.execution_id,
+            iteration=request.iteration,
+            attempt=request.attempt,
+            execution_status="COMPLETED",
+            outcome="SUCCESS",
+            data={
+                "document": {
+                    "title": "Требования к обработке заявок",
+                    "format": "markdown",
+                    "path": "analysis.md",
+                }
+            },
+            artifacts=[
+                {
+                    "type": "file",
+                    "uri": "artifact://analysis.md",
+                    "summary": "Требования к обработке заявок",
+                },
+                {"type": "log", "uri": "artifact://stdout.log"},
+            ],
+        )
+
+    monkeypatch.setattr(service, "run", run_agent)
+    client = TestClient(create_app(service))
+
+    response = client.post(
+        "/v1/analysis",
+        json={
+            "request": "Изучи документацию и составь требования",
+            "title": "Требования к обработке заявок",
+        },
+    )
+
+    assert response.status_code == 202
+    created = response.json()
+    assert created["scenario_id"] == "analysis-document"
+    assert created["trigger"]["data"]["request"] == "Изучи документацию и составь требования"
+    assert service.workflow_queue.get(created["id"]).status == "PENDING"
+    assert process_one(service, worker_id="analysis-worker", heartbeat_seconds=0.01)
+
+    completed = client.get(f"/v1/workflows/{created['id']}").json()
+    assert completed["status"] == "COMPLETED"
+    execution = completed["executions"][0]
+    assert execution["data"]["document"]["format"] == "markdown"
+    assert execution["artifacts"][0]["type"] == "document"
+    assert execution["artifacts"][0]["uri"] == (
+        f"artifact://{execution['execution_id']}/analysis.md"
+    )
+    artifact = client.get(f"/v1/agent-steps/{execution['execution_id']}/artifacts/analysis.md")
+    assert artifact.status_code == 200
+    assert artifact.text.startswith("# Требования к обработке заявок")
+    assert client.post("/v1/analysis", json={"request": "  "}).status_code == 422
+
+
 def test_cancel_pending_workflow_endpoint(image_resolver, tmp_path: Path):
     sandbox = SandboxManager(tmp_path / "jobs")
     service = AgentService(ContextBuilder(), image_resolver, sandbox)
@@ -163,10 +278,13 @@ def test_retry_failed_workflow_endpoint(image_resolver, tmp_path: Path):
             "data": {},
         },
     ).json()
-    assert client.post(
-        f"/v1/workflows/{created['id']}/retry",
-        json={"reason": "Too early"},
-    ).status_code == 409
+    assert (
+        client.post(
+            f"/v1/workflows/{created['id']}/retry",
+            json={"reason": "Too early"},
+        ).status_code
+        == 409
+    )
 
     assert service.workflow_queue.cancel_pending(created["id"])
     failed = service.workflow_engine.get(created["id"])
@@ -187,7 +305,7 @@ def test_retry_failed_workflow_endpoint(image_resolver, tmp_path: Path):
     assert any(item["action"] == "workflow.retry.requested" for item in events)
 
 
-def test_signed_gitea_webhook_is_idempotent(image_resolver, tmp_path: Path, monkeypatch):
+def test_signed_gitea_push_webhook_is_ignored(image_resolver, tmp_path: Path, monkeypatch):
     sandbox = SandboxManager(tmp_path / "jobs")
     service = AgentService(ContextBuilder(), image_resolver, sandbox)
     service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
@@ -196,26 +314,11 @@ def test_signed_gitea_webhook_is_idempotent(image_resolver, tmp_path: Path, monk
         WorkflowStore(tmp_path / "workflows"),
         service,
     )
-    agent_requests = []
-
-    def run_agent(request):
-        agent_requests.append(request)
-        return StepResult(
-            step_id=request.step.id,
-            execution_id=request.execution_id,
-            iteration=request.iteration,
-            attempt=request.attempt,
-            execution_status="COMPLETED",
-            outcome="SUCCESS",
-            data={
-                "summary": "Push analyzed",
-                "provider": request.step.provider,
-                "model": request.step.model,
-            },
-            artifacts=[],
-        )
-
-    monkeypatch.setattr(service, "run", run_agent)
+    monkeypatch.setattr(
+        service,
+        "run",
+        lambda request: (_ for _ in ()).throw(AssertionError("push must not call an agent")),
+    )
     client = TestClient(create_app(service))
     secret = "test-webhook-secret"
     monkeypatch.setenv("GITEA_WEBHOOK_SECRET", secret)
@@ -247,21 +350,10 @@ def test_signed_gitea_webhook_is_idempotent(image_resolver, tmp_path: Path, monk
     duplicate = client.post("/v1/webhooks/gitea", content=body, headers=headers)
 
     assert first.status_code == 202
-    assert first.json()["status"] == "CREATED"
-    assert first.json()["trigger"]["data"]["repository"]["full_name"] == ("harnes/payments-api")
-    assert service.workflow_queue.get(first.json()["id"]).status == "PENDING"
-    assert len(agent_requests) == 0
-    assert process_one(service, worker_id="test-worker", heartbeat_seconds=0.01)
-    completed = client.get(f"/v1/workflows/{first.json()['id']}").json()
-    assert completed["status"] == "COMPLETED"
-    assert completed["executions"][0]["step_id"] == "analyze-push"
-    assert len(agent_requests) == 1
-    assert agent_requests[0].step.provider == "openrouter"
-    assert agent_requests[0].step.model == "openai/gpt-4.1-nano"
-    assert agent_requests[0].context.trigger_data["commits"][0]["message"] == "test push"
-    assert service.workflow_queue.get(first.json()["id"]).status == "COMPLETED"
-    assert duplicate.json()["id"] == first.json()["id"]
-    assert len(client.get("/v1/workflows").json()) == 1
+    assert first.json() == {"accepted": False, "reason": "push workflows are disabled"}
+    assert duplicate.status_code == 202
+    assert duplicate.json() == first.json()
+    assert client.get("/v1/workflows").json() == []
     assert (
         client.post(
             "/v1/webhooks/gitea",
@@ -271,28 +363,10 @@ def test_signed_gitea_webhook_is_idempotent(image_resolver, tmp_path: Path, monk
         == 401
     )
 
-    invalid_body = json.dumps(
-        {"ref": "refs/heads/main", "repository": {}, "commits": []},
-        separators=(",", ":"),
-    ).encode()
-    invalid_signature = hmac.new(secret.encode(), invalid_body, hashlib.sha256).hexdigest()
-    invalid = client.post(
-        "/v1/webhooks/gitea",
-        content=invalid_body,
-        headers={
-            **headers,
-            "X-Gitea-Delivery": "delivery-2",
-            "X-Gitea-Signature": invalid_signature,
-        },
-    )
-    assert invalid.status_code == 422
-
     automation_payload = json.loads(body)
     automation_payload["ref"] = "refs/heads/automation/wf-test"
     automation_body = json.dumps(automation_payload, separators=(",", ":")).encode()
-    automation_signature = hmac.new(
-        secret.encode(), automation_body, hashlib.sha256
-    ).hexdigest()
+    automation_signature = hmac.new(secret.encode(), automation_body, hashlib.sha256).hexdigest()
     ignored = client.post(
         "/v1/webhooks/gitea",
         content=automation_body,
@@ -303,11 +377,8 @@ def test_signed_gitea_webhook_is_idempotent(image_resolver, tmp_path: Path, monk
         },
     )
     assert ignored.status_code == 202
-    assert ignored.json() == {
-        "accepted": False,
-        "reason": "automation branch push is handled by its parent workflow",
-    }
-    assert len(client.get("/v1/workflows").json()) == 1
+    assert ignored.json() == first.json()
+    assert client.get("/v1/workflows").json() == []
 
 
 def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
@@ -401,6 +472,7 @@ def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
     assert testing.json()["workflow"]["trigger"]["data"]["repository"] == {
         "full_name": "team/service",
         "implementation_ref": "feature/payment-retry",
+        "selection_source": "project_mapping",
     }
 
     payload["data"]["state_detail"] = {"id": "state-backlog", "name": "Backlog"}
@@ -417,6 +489,214 @@ def test_signed_plane_webhook_normalizes_ready_issue_and_is_idempotent(
         "accepted": False,
         "reason": "issue is not in an actionable state",
     }
+
+
+def test_plane_ready_issue_uses_allowed_repository_link_without_project_mapping(
+    image_resolver, tmp_path: Path, monkeypatch
+):
+    class StubPlane:
+        def get_repository_source(self, **kwargs):
+            assert kwargs == {"project_id": "project-1", "issue_id": "issue-1"}
+            return {
+                "full_name": "team/linked-service",
+                "source_url": "http://localhost:3000/team/linked-service",
+            }
+
+    class StubGitea:
+        def __init__(self):
+            self.allowed_repositories = {"team/linked-service"}
+
+    sandbox = SandboxManager(tmp_path / "jobs")
+    service = AgentService(ContextBuilder(), image_resolver, sandbox)
+    service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    service.workflow_engine = WorkflowEngine(
+        service.scenario_registry,
+        WorkflowStore(tmp_path / "workflows"),
+        service,
+        command_executor=CommandExecutor(StubGitea(), StubPlane()),
+    )
+    secret = "plane-webhook-secret"
+    monkeypatch.setenv("PLANE_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("PLANE_READY_STATE_NAMES", "Ready for development")
+    monkeypatch.setenv("PLANE_PROJECT_REPOSITORIES", "{}")
+    payload = {
+        "event": "issue",
+        "action": "update",
+        "webhook_id": "webhook-linked-repository",
+        "data": {
+            "id": "issue-1",
+            "name": "Implement linked service change",
+            "description_stripped": "Use the work item source repository.",
+            "updated_at": "2026-08-24T12:00:00Z",
+            "project": {"id": "project-1", "identifier": "PAY"},
+            "state_detail": {"name": "Ready for development"},
+        },
+    }
+    body = json.dumps(payload).encode()
+    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    client = TestClient(create_app(service))
+
+    response = client.post(
+        "/v1/webhooks/plane",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Plane-Event": "issue",
+            "X-Plane-Delivery": "delivery-linked-repository",
+            "X-Plane-Signature": signature,
+        },
+    )
+
+    assert response.status_code == 202
+    repository = response.json()["workflow"]["trigger"]["data"]["repository"]
+    assert repository == {
+        "full_name": "team/linked-service",
+        "implementation_ref": None,
+        "selection_source": "plane_link",
+        "source_url": "http://localhost:3000/team/linked-service",
+    }
+
+
+def test_plane_cancelled_state_cancels_waiting_development_workflow(
+    image_resolver, tmp_path: Path, monkeypatch
+):
+    sandbox = SandboxManager(tmp_path / "jobs")
+    service = AgentService(ContextBuilder(), image_resolver, sandbox)
+    service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    store = WorkflowStore(tmp_path / "workflows")
+    service.workflow_engine = WorkflowEngine(service.scenario_registry, store, service)
+    workflow = WorkflowInstance(
+        id="wf-plane-cancel",
+        scenario_id="implement-ticket",
+        scenario_version="5",
+        trigger=TriggerEvent(
+            source="plane",
+            event="issue.ready_for_development",
+            event_id="ready-before-cancel",
+            data={
+                "ticket": {"id": "issue-1"},
+                "project": {"id": "project-1"},
+                "repository": {"full_name": "team/service"},
+            },
+        ),
+        status="WAITING",
+        current_step="await-development-review",
+        pending_review=PendingReview(
+            step_id="await-development-review",
+            execution_id="review-execution-1",
+            iteration=1,
+            provider="plane",
+        ),
+    )
+    store.save(workflow)
+    secret = "plane-webhook-secret"
+    monkeypatch.setenv("PLANE_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("PLANE_CANCELLED_STATE_IDS", "state-cancelled")
+    payload = {
+        "event": "issue",
+        "action": "updated",
+        "webhook_id": "webhook-cancelled",
+        "data": {
+            "id": "issue-1",
+            "name": "Cancelled change",
+            "updated_at": "2026-08-24T13:00:00Z",
+            "project": {"id": "project-1", "identifier": "PAY"},
+            "state_detail": {"id": "state-cancelled", "name": "Cancelled"},
+        },
+    }
+    body = json.dumps(payload).encode()
+    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    client = TestClient(create_app(service))
+
+    response = client.post(
+        "/v1/webhooks/plane",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Plane-Event": "issue",
+            "X-Plane-Delivery": "delivery-cancelled",
+            "X-Plane-Signature": signature,
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["workflow"]["status"] == "CANCELLED"
+    assert service.workflow_engine.get(workflow.id).status == "CANCELLED"
+
+
+def test_plane_ready_state_returns_waiting_workflow_to_same_development_cycle(
+    image_resolver, tmp_path: Path, monkeypatch
+):
+    sandbox = SandboxManager(tmp_path / "jobs")
+    service = AgentService(ContextBuilder(), image_resolver, sandbox)
+    service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    store = WorkflowStore(tmp_path / "workflows")
+    service.workflow_engine = WorkflowEngine(service.scenario_registry, store, service)
+    workflow = WorkflowInstance(
+        id="wf-plane-return",
+        scenario_id="implement-ticket",
+        scenario_version="6",
+        trigger=TriggerEvent(
+            source="plane",
+            event="issue.ready_for_development",
+            event_id="ready-original",
+            data={
+                "ticket": {"id": "issue-1", "description": "Original requirements"},
+                "project": {"id": "project-1", "identifier": "PAY"},
+                "repository": {"full_name": "team/service"},
+            },
+        ),
+        status="WAITING",
+        current_step="await-development-review",
+        pending_review=PendingReview(
+            step_id="await-development-review",
+            execution_id="review-execution-1",
+            iteration=1,
+            provider="plane",
+        ),
+    )
+    store.save(workflow)
+    secret = "plane-webhook-secret"
+    monkeypatch.setenv("PLANE_WEBHOOK_SECRET", secret)
+    monkeypatch.setenv("PLANE_READY_STATE_NAMES", "Ready for development")
+    monkeypatch.setenv("PLANE_PROJECT_REPOSITORIES", '{"PAY":"team/service"}')
+    payload = {
+        "event": "issue",
+        "action": "updated",
+        "webhook_id": "webhook-returned",
+        "data": {
+            "id": "issue-1",
+            "name": "Revise change",
+            "description_stripped": "Revised requirements",
+            "updated_at": "2026-08-24T13:05:00Z",
+            "project": {"id": "project-1", "identifier": "PAY"},
+            "state_detail": {"id": "state-ready", "name": "Ready for development"},
+        },
+    }
+    body = json.dumps(payload).encode()
+    signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    client = TestClient(create_app(service))
+
+    response = client.post(
+        "/v1/webhooks/plane",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Plane-Event": "issue",
+            "X-Plane-Delivery": "delivery-returned",
+            "X-Plane-Signature": signature,
+        },
+    )
+
+    assert response.status_code == 202
+    resumed = response.json()["workflow"]
+    assert resumed["id"] == workflow.id
+    assert resumed["status"] == "RUNNING"
+    assert resumed["current_step"] == "sync-development-started"
+    assert resumed["trigger"]["data"]["ticket"]["description"] == "Revised requirements"
+    assert resumed["review_comments"] == [
+        "Returned in Plane for another development iteration"
+    ]
 
 
 def test_signed_gitea_review_webhook_resumes_waiting_workflow(
@@ -566,9 +846,7 @@ def test_gitea_merge_decision_ignores_approval_and_handles_merge_or_close(
             },
             separators=(",", ":"),
         ).encode()
-        approval_signature = hmac.new(
-            secret.encode(), approval_body, hashlib.sha256
-        ).hexdigest()
+        approval_signature = hmac.new(secret.encode(), approval_body, hashlib.sha256).hexdigest()
         ignored = client.post(
             "/v1/webhooks/gitea",
             content=approval_body,
@@ -608,9 +886,7 @@ def test_gitea_merge_decision_ignores_approval_and_handles_merge_or_close(
         )
         assert decided.status_code == 202
         assert decided.json()["status"] == "RUNNING"
-        assert process_one(
-            service, worker_id=f"merge-finish-{sequence}", heartbeat_seconds=0.01
-        )
+        assert process_one(service, worker_id=f"merge-finish-{sequence}", heartbeat_seconds=0.01)
         completed = client.get(f"/v1/workflows/{waiting['id']}").json()
         assert completed["status"] == "COMPLETED"
         assert completed["outcome"] == ("SUCCESS" if merged else "FAILURE")
@@ -637,16 +913,44 @@ def test_implement_ticket_produces_branch_ready_for_testing(
                         snippet="Reference only",
                         url="https://kb/A-1",
                         source="Confluence",
+                        document_id="A-1",
                     )
                 ],
             )
 
+        def fetch_document(self, result, **_kwargs):
+            return result.model_copy(
+                update={
+                    "content": "# Payment retry\n\nRetry transient payment failures.",
+                    "content_fetched": True,
+                    "content_format": "markdown",
+                }
+            )
+
     swirl = StubSwirl()
+    plane_calls = []
+
+    class StubPlane:
+        def get_repository_source(self, **_kwargs):
+            return None
+
+        def get_implementation_source(self, **_kwargs):
+            return None
+
+        def record_result(self, **kwargs):
+            plane_calls.append(kwargs)
+            return {
+                "recommendation": kwargs["recommendation"],
+                "comment_created": True,
+                "state_updated": True,
+            }
+
     service.workflow_engine = WorkflowEngine(
         service.scenario_registry,
         WorkflowStore(tmp_path / "workflows"),
         service,
         swirl_client=swirl,
+        command_executor=CommandExecutor(plane_client=StubPlane()),
     )
     agent_requests = []
 
@@ -714,12 +1018,19 @@ def test_implement_ticket_produces_branch_ready_for_testing(
     assert plane_response.status_code == 202
     created = plane_response.json()["workflow"]
     assert process_one(service, worker_id="ticket-worker", heartbeat_seconds=0.01)
-    completed = client.get(f"/v1/workflows/{created['id']}").json()
-    assert completed["status"] == "COMPLETED"
-    assert completed["executions"][-1]["data"]["plane_recommendation"] == "move_to_testing"
+    waiting = client.get(f"/v1/workflows/{created['id']}").json()
+    assert waiting["status"] == "WAITING"
+    assert waiting["current_step"] == "await-development-review"
+    assert waiting["pending_review"]["provider"] == "plane"
+    assert [call["recommendation"] for call in plane_calls] == [
+        "development_started",
+        "development_review",
+    ]
     assert len(agent_requests) == 1
     assert agent_requests[0].context.swirl_results[0]["url"] == "https://kb/A-1"
-    assert swirl.queries == ["Fix payment retry"]
+    assert swirl.queries[0] == "Fix payment retry"
+    assert "payment" in swirl.queries
+    assert "retry" in swirl.queries
 
     plane_payload["data"]["state_detail"] = {
         "id": "testing-state",
@@ -727,9 +1038,7 @@ def test_implement_ticket_produces_branch_ready_for_testing(
     }
     plane_payload["data"]["updated_at"] = "2026-08-20T10:01:00Z"
     testing_body = json.dumps(plane_payload).encode()
-    testing_signature = hmac.new(
-        plane_secret.encode(), testing_body, hashlib.sha256
-    ).hexdigest()
+    testing_signature = hmac.new(plane_secret.encode(), testing_body, hashlib.sha256).hexdigest()
     testing_response = client.post(
         "/v1/webhooks/plane",
         content=testing_body,
@@ -742,10 +1051,22 @@ def test_implement_ticket_produces_branch_ready_for_testing(
     )
 
     assert testing_response.status_code == 202
+    assert testing_response.json()["development_workflow_id"] == created["id"]
     source = testing_response.json()["workflow"]["trigger"]["data"]["repository"]
     assert source == {
         "full_name": "team/service",
+        "selection_source": "project_mapping",
         "implementation_ref": f"automation/{created['id']}",
         "implementation_commit": "a" * 40,
         "implementation_workflow_id": created["id"],
     }
+    assert process_one(service, worker_id="development-review-worker", heartbeat_seconds=0.01)
+    completed = client.get(f"/v1/workflows/{created['id']}").json()
+    assert completed["status"] == "COMPLETED"
+    assert completed["outcome"] == "SUCCESS"
+    assert completed["executions"][-1]["data"]["plane_recommendation"] == "move_to_testing"
+    assert [call["recommendation"] for call in plane_calls] == [
+        "development_started",
+        "development_review",
+        "approved_for_testing",
+    ]

@@ -10,9 +10,11 @@
     "baseUrlEnv": "SWIRL_BASE_URL",
     "usernameEnv": "SWIRL_USERNAME",
     "passwordEnv": "SWIRL_PASSWORD",
+    "allowedContentOriginsEnv": "SWIRL_CONTENT_ALLOWED_ORIGINS",
+    "contentRoutesEnv": "SWIRL_CONTENT_ROUTES_JSON",
     "maxResults": 20
   },
-  "required_environment": ["SWIRL_BASE_URL", "SWIRL_USERNAME", "SWIRL_PASSWORD"],
+  "required_environment": ["SWIRL_BASE_URL", "SWIRL_USERNAME", "SWIRL_PASSWORD", "SWIRL_CONTENT_ALLOWED_ORIGINS", "SWIRL_CONTENT_ROUTES_JSON"],
   "source_dir": "source",
   "built_into_image": false,
   "enabled": true

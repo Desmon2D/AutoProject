@@ -1,6 +1,9 @@
 {
   "id": "manual-review",
   "version": "1",
+  "stage": "system",
+  "title": "Проверка ручного решения",
+  "description": "Технический сценарий для проверки ожидания и обработки пользовательского review.",
   "trigger": {
     "source": "manual",
     "event": "review-demo"

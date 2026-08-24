@@ -35,6 +35,8 @@ def test_rejects_unknown_plugin_and_resolves_swirl(plugin_root):
         "SWIRL_BASE_URL",
         "SWIRL_USERNAME",
         "SWIRL_PASSWORD",
+        "SWIRL_CONTENT_ALLOWED_ORIGINS",
+        "SWIRL_CONTENT_ROUTES_JSON",
     ]
 
 

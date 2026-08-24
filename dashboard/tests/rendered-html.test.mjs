@@ -28,6 +28,8 @@ test("server-renders the operations dashboard", async () => {
   assert.match(html, /SWIRL/);
   assert.match(html, /BookStack/);
   assert.match(html, /Технические ошибки/i);
+  assert.match(html, /Новый аналитический документ/i);
+  assert.match(html, /Запустить анализ/i);
   assert.doesNotMatch(html, />Skills</);
   assert.doesNotMatch(html, /codex-preview|react-loading-skeleton/i);
 });
@@ -41,4 +43,11 @@ test("workflow controls are wired to orchestrator actions", async () => {
   assert.match(source, /На доработку/);
   assert.match(source, /Повторить/);
   assert.match(source, /Отменить/);
+  assert.match(source, /\/v1\/analysis/);
+  assert.match(source, /\/artifacts\//);
+  assert.match(source, /development: "Разработка"/);
+  assert.match(source, /"bug-finding": "Поиск ошибок"/);
+  assert.match(source, /Передать в тестирование/);
+  assert.match(source, /Вернуть в разработку/);
+  assert.match(source, /pending_review/);
 });

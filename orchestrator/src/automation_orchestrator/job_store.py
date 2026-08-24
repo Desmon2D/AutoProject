@@ -78,6 +78,12 @@ class JobStore:
             return None
         return StepResult.model_validate_json(path.read_text(encoding="utf-8"))
 
+    def get_request(self, execution_id: str) -> AgentRunRequest | None:
+        path = self.root / execution_id / "request.json"
+        if not path.is_file():
+            return None
+        return AgentRunRequest.model_validate_json(path.read_text(encoding="utf-8"))
+
     def artifact(self, execution_id: str, relative_path: str) -> Path | None:
         normalized = Path(relative_path).as_posix()
         if self.artifacts.get(execution_id, normalized) is None:

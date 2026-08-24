@@ -17,6 +17,9 @@ template_path = Path(
 provider = json.loads(template_path.read_text(encoding="utf-8"))
 provider["url"] = f"{base_url}/api/search"
 provider["http_request_headers"]["Authorization"] = f"Token {token_id}:{token_secret}"
+provider["page_fetch_config_json"]["headers"]["Authorization"] = (
+    f"Token {token_id}:{token_secret}"
+)
 
 username = os.environ["SWIRL_USERNAME"]
 owner = get_user_model().objects.get(username=username)

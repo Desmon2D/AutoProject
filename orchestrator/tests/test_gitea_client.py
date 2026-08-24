@@ -105,3 +105,69 @@ def test_verifies_remote_branch_commit():
             branch="automation/wf-1",
             commit="b" * 40,
         )
+
+
+def test_verifies_commit_ancestry_from_gitea_graph():
+    requests = []
+
+    def opener(request, **_kwargs):
+        requests.append(request)
+        return Response(json.dumps({"parents": [{"sha": "b" * 40}]}).encode())
+
+    client = GiteaClient(
+        "http://gitea:3000",
+        "secret",
+        {"team/service"},
+        opener=opener,
+    )
+
+    client.verify_descendant(
+        repository="team/service",
+        ancestor="b" * 40,
+        descendant="a" * 40,
+    )
+
+    assert requests[0].full_url.endswith(f"/git/commits/{'a' * 40}")
+
+
+def test_rejects_commit_outside_required_ancestry():
+    responses = iter(
+        [
+            {"parents": [{"sha": "c" * 40}]},
+            {"parents": []},
+        ]
+    )
+    client = GiteaClient(
+        "http://gitea:3000",
+        "secret",
+        {"team/service"},
+        opener=lambda *_args, **_kwargs: Response(json.dumps(next(responses)).encode()),
+    )
+
+    with pytest.raises(GiteaClientError, match="not descended"):
+        client.verify_descendant(
+            repository="team/service",
+            ancestor="b" * 40,
+            descendant="a" * 40,
+        )
+
+
+def test_downloads_exact_commit_archive_with_authentication():
+    requests = []
+
+    def opener(request, **_kwargs):
+        requests.append(request)
+        return Response(b"archive")
+
+    client = GiteaClient(
+        "http://gitea:3000",
+        "secret",
+        {"team/service"},
+        opener=opener,
+    )
+
+    payload = client.download_archive(repository="team/service", commit="a" * 40)
+
+    assert payload == b"archive"
+    assert requests[0].get_header("Authorization") == "token secret"
+    assert requests[0].full_url.endswith(f"/archive/{'a' * 40}.tar.gz")

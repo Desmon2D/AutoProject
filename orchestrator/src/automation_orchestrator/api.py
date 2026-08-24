@@ -21,6 +21,7 @@ from .job_store import IdempotencyConflict
 from .models import (
     IDENTIFIER_PATTERN,
     AgentRunRequest,
+    AnalysisRequest,
     ArtifactCleanupResult,
     ArtifactRecord,
     AuditEvent,
@@ -38,6 +39,7 @@ from .models import (
     WorkflowActionRequest,
     WorkflowInstance,
 )
+from .plane_client import PlaneClientError
 from .plane_webhook import (
     PlaneWebhookError,
     normalize_plane_webhook,
@@ -108,11 +110,7 @@ def _review_comments(payload: dict[str, Any]) -> list[str]:
     comments: list[str] = []
     for key in ("review", "comment"):
         item = payload.get(key)
-        body = (
-            item.get("body") or item.get("content")
-            if isinstance(item, dict)
-            else None
-        )
+        body = item.get("body") or item.get("content") if isinstance(item, dict) else None
         if isinstance(body, str) and body.strip():
             comments.append(body.strip()[:4000])
     return comments
@@ -241,6 +239,47 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         return registry.list()
 
     @application.post(
+        "/v1/analysis",
+        response_model=WorkflowInstance,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def request_analysis(payload: AnalysisRequest, request: Request) -> WorkflowInstance:
+        engine = getattr(request.app.state.service, "workflow_engine", None)
+        if engine is None:
+            raise HTTPException(status_code=503, detail="workflow engine is not configured")
+        trigger = TriggerEvent(
+            source="manual",
+            event="analysis.requested",
+            event_id=f"analysis-{uuid4().hex}",
+            data={
+                "request": payload.request,
+                "title": payload.title,
+                "search_query": payload.request[:2000],
+            },
+        )
+        try:
+            workflow, created = engine.create(trigger)
+            enqueued = request.app.state.service.workflow_queue.enqueue(workflow.id)
+            if not enqueued:
+                raise WorkflowExecutionError("analysis workflow could not be queued")
+            _audit_request(
+                request,
+                action="analysis.requested",
+                resource_type="workflow",
+                resource_id=workflow.id,
+                details={
+                    "created": created,
+                    "title": payload.title,
+                    "request_length": len(payload.request),
+                },
+            )
+            return workflow
+        except ScenarioResolutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except WorkflowExecutionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.post(
         "/v1/triggers",
         response_model=WorkflowInstance,
         status_code=status.HTTP_202_ACCEPTED,
@@ -319,9 +358,9 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 ready_state_ids=parse_csv(os.environ.get("PLANE_READY_STATE_IDS", "")),
                 ready_state_names=parse_csv(os.environ.get("PLANE_READY_STATE_NAMES", "")),
                 testing_state_ids=parse_csv(os.environ.get("PLANE_TESTING_STATE_IDS", "")),
-                testing_state_names=parse_csv(
-                    os.environ.get("PLANE_TESTING_STATE_NAMES", "")
-                ),
+                testing_state_names=parse_csv(os.environ.get("PLANE_TESTING_STATE_NAMES", "")),
+                cancelled_state_ids=parse_csv(os.environ.get("PLANE_CANCELLED_STATE_IDS", "")),
+                cancelled_state_names={"cancelled", "canceled"},
             )
         except PlaneWebhookError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -340,6 +379,83 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
         try:
             trigger = engine.attach_plane_implementation(normalized.trigger)
+            if trigger.event == "issue.cancelled":
+                active = engine.find_plane_workflow(
+                    trigger,
+                    scenario_id="implement-ticket",
+                    statuses={"CREATED", "RUNNING", "WAITING"},
+                ) or engine.find_plane_workflow(
+                    trigger,
+                    scenario_id="test-ticket",
+                    statuses={"CREATED", "RUNNING", "WAITING"},
+                )
+                if active is None:
+                    return {"accepted": False, "reason": "no active workflow to cancel"}
+                workflow = engine.cancel(active.id, reason="Plane issue moved to Cancelled")
+                request.app.state.service.workflow_queue.cancel_pending(workflow.id)
+                _audit_request(
+                    request,
+                    action="plane.workflow.cancelled",
+                    resource_type="workflow",
+                    resource_id=workflow.id,
+                    details={"event_id": trigger.event_id},
+                )
+                return {
+                    "accepted": True,
+                    "created": False,
+                    "enqueued": False,
+                    "workflow": workflow.model_dump(mode="json"),
+                }
+
+            resumed_development = None
+            if trigger.event in {"issue.ready_for_development", "issue.testing"}:
+                waiting = engine.find_plane_workflow(
+                    trigger,
+                    scenario_id="implement-ticket",
+                    statuses={"WAITING"},
+                    review_provider="plane",
+                )
+                if waiting is not None:
+                    approved = trigger.event == "issue.testing"
+                    resumed_development = engine.review(
+                        waiting.id,
+                        ReviewDecision(
+                            outcome="SUCCESS" if approved else "FAILURE",
+                            comments=[
+                                "Approved in Plane for testing"
+                                if approved
+                                else "Returned in Plane for another development iteration"
+                            ],
+                            external_event_id=trigger.event_id,
+                        ),
+                        advance=False,
+                        refreshed_trigger=trigger,
+                    )
+                    request.app.state.service.workflow_queue.enqueue(
+                        resumed_development.id,
+                        requeue_if_running=True,
+                    )
+                    if not approved:
+                        return {
+                            "accepted": True,
+                            "created": False,
+                            "enqueued": True,
+                            "workflow": resumed_development.model_dump(mode="json"),
+                        }
+
+            if trigger.event == "issue.testing":
+                active_testing = engine.find_plane_workflow(
+                    trigger,
+                    scenario_id="test-ticket",
+                    statuses={"CREATED", "RUNNING", "WAITING"},
+                )
+                if active_testing is not None:
+                    return {
+                        "accepted": True,
+                        "created": False,
+                        "enqueued": False,
+                        "workflow": active_testing.model_dump(mode="json"),
+                    }
             workflow, created = engine.create(trigger)
             enqueued = False
             if workflow.status in {"CREATED", "RUNNING"}:
@@ -360,6 +476,11 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 "created": created,
                 "enqueued": enqueued,
                 "workflow": workflow.model_dump(mode="json"),
+                **(
+                    {"development_workflow_id": resumed_development.id}
+                    if resumed_development is not None
+                    else {}
+                ),
             }
         except ScenarioResolutionError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -428,14 +549,14 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             pending = workflow.pending_review
             if pending is None:
                 return workflow
+            if pending.provider != "gitea":
+                return workflow
             if pending.decision == "merge":
                 if not is_pull_closed:
                     return workflow
                 pull = payload.get("pull_request")
                 merged = (
-                    pull_action == "merged"
-                    or isinstance(pull, dict)
-                    and pull.get("merged") is True
+                    pull_action == "merged" or isinstance(pull, dict) and pull.get("merged") is True
                 )
                 decision_outcome = "SUCCESS" if merged else "FAILURE"
             else:
@@ -501,6 +622,20 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="workflow not found")
             return workflow
 
+        if event_type == "push":
+            _audit_request(
+                request,
+                action="gitea.webhook.ignored",
+                resource_type="webhook",
+                outcome="SUCCESS",
+                details={
+                    "event_type": event_type,
+                    "delivery": delivery,
+                    "reason": "push workflows disabled",
+                },
+            )
+            return IgnoredWebhook(reason="push workflows are disabled")
+
         repository = payload.get("repository")
         pusher = payload.get("pusher") or payload.get("sender")
         commits = payload.get("commits")
@@ -542,19 +677,6 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail="Gitea push has no repository full_name")
         if not isinstance(ref, str) or not ref.strip():
             raise HTTPException(status_code=422, detail="Gitea push has no ref")
-        if event_type == "push" and ref.startswith("refs/heads/automation/"):
-            _audit_request(
-                request,
-                action="gitea.webhook.ignored",
-                resource_type="webhook",
-                outcome="SUCCESS",
-                details={
-                    "event_type": event_type,
-                    "delivery": delivery,
-                    "reason": "automation branch push",
-                },
-            )
-            return IgnoredWebhook(reason="automation branch push is handled by its parent workflow")
         try:
             workflow, created = engine.create(
                 TriggerEvent(
@@ -648,6 +770,35 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         if engine is None:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
         try:
+            current = engine.get(workflow_id)
+            if current is None:
+                raise WorkflowExecutionError(f"unknown workflow: {workflow_id}")
+            if current.trigger.source == "plane":
+                plane_client = engine.command_executor.plane_client
+                ticket = current.trigger.data.get("ticket")
+                project = current.trigger.data.get("project")
+                issue_id = ticket.get("id") if isinstance(ticket, dict) else None
+                project_id = project.get("id") if isinstance(project, dict) else None
+                if not isinstance(project_id, str) and isinstance(project, dict):
+                    references = project.get("references")
+                    project_id = (
+                        next((item for item in references if isinstance(item, str)), None)
+                        if isinstance(references, list)
+                        else None
+                    )
+                if (
+                    plane_client is not None
+                    and isinstance(issue_id, str)
+                    and isinstance(project_id, str)
+                ):
+                    plane_client.record_result(
+                        project_id=project_id,
+                        issue_id=issue_id,
+                        workflow_id=current.id,
+                        recommendation="cancelled",
+                        summary=payload.reason,
+                        details={},
+                    )
             workflow = engine.cancel(workflow_id, reason=payload.reason)
             request.app.state.service.workflow_queue.cancel_pending(workflow.id)
             _audit_request(
@@ -658,7 +809,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 details={"reason": payload.reason},
             )
             return workflow
-        except WorkflowExecutionError as exc:
+        except (WorkflowExecutionError, PlaneClientError) as exc:
             message = str(exc)
             status_code = 404 if message.startswith("unknown workflow") else 409
             raise HTTPException(status_code=status_code, detail=message) from exc

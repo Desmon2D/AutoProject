@@ -61,6 +61,23 @@ h2 { margin: 0; font-size: 19px; letter-spacing: -.025em; }
 .status-rail a { margin-left: auto; color: var(--muted); text-decoration: none; }
 .status-rail a:hover { color: var(--ink); text-decoration: underline; }
 
+.analysis-panel { display: grid; grid-template-columns: minmax(240px, .65fr) minmax(0, 1.35fr); margin-top: 24px; border-color: var(--ink); }
+.analysis-copy { padding: 22px; border-right: 1px solid var(--ink); background: var(--acid); }
+.analysis-copy p:last-child { max-width: 460px; margin: 10px 0 0; color: #414a19; font-size: 12px; line-height: 1.5; }
+.analysis-form { display: grid; gap: 8px; padding: 20px 22px; }
+.analysis-form label { color: var(--muted); font-size: 10px; font-weight: 650; letter-spacing: .08em; text-transform: uppercase; }
+.analysis-form label span { font-weight: 400; letter-spacing: 0; text-transform: none; }
+.analysis-form input, .analysis-form textarea { width: 100%; padding: 10px 11px; border: 1px solid var(--line); background: white; color: var(--ink); font: inherit; font-size: 12px; }
+.analysis-form textarea { min-height: 96px; resize: vertical; }
+.analysis-form input:focus, .analysis-form textarea:focus { border-color: var(--ink); outline: 1px solid var(--ink); }
+.analysis-submit-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.analysis-submit-row small { color: var(--muted); font-size: 10px; }
+.analysis-submit-row button { min-height: 38px; padding: 0 15px; border: 1px solid var(--ink); background: var(--ink); color: var(--acid); cursor: pointer; white-space: nowrap; }
+.analysis-submit-row button:disabled { cursor: wait; opacity: .5; }
+.analysis-feedback { margin: 2px 0 0; padding: 8px 10px; font-size: 11px; }
+.analysis-feedback.is-success { background: #e3f1e5; color: #285d32; }
+.analysis-feedback.is-error { background: #fff0ed; color: #843627; }
+
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); margin: 24px 0; border: 1px solid var(--ink); }
 .metric-card { min-height: 142px; padding: 20px; background: var(--panel); border-right: 1px solid var(--ink); }
 .metric-card:last-child { border-right: 0; }
@@ -112,6 +129,7 @@ td small { margin-top: 5px; color: var(--muted); font-size: 10px; }
 .inspection-meta > span:last-child { border-right: 0; }
 .inspection-meta small, .scenario-overview small { display: block; margin-bottom: 4px; color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
 .workflow-actions { display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 8px 14px; padding: 14px 16px; border-bottom: 1px solid var(--line); background: #fffdf3; }
+.workflow-actions .action-context { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .workflow-actions label { grid-column: 1 / -1; color: var(--muted); font-size: 10px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; }
 .workflow-actions textarea { width: 100%; min-height: 60px; padding: 9px 10px; resize: vertical; border: 1px solid var(--line); background: white; color: var(--ink); font: inherit; font-size: 11px; }
 .workflow-actions textarea:focus { border-color: var(--ink); outline: 1px solid var(--ink); }
@@ -135,6 +153,11 @@ td small { margin-top: 5px; color: var(--muted); font-size: 10px; }
 .json-block { max-height: 340px; margin: 0; padding: 13px 14px; overflow: auto; border: 1px solid #2d312b; background: #151713; color: #dfe4d8; font-family: var(--font-geist-mono), monospace; font-size: 10px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
 .json-empty { display: grid; place-items: center; min-height: 58px; border: 1px dashed var(--line); color: var(--muted); font-size: 10px; }
 .json-empty.large { min-height: 100px; }
+.artifact-links { display: grid; gap: 6px; margin-top: 9px; }
+.artifact-links a { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid var(--ink); background: var(--acid); text-decoration: none; }
+.artifact-links a:hover { background: var(--ink); color: var(--acid); }
+.artifact-links span { font-size: 10px; font-weight: 700; }
+.artifact-links small { max-width: 55%; overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .execution-list { border-top: 1px solid var(--line); }
 .section-label { padding: 10px 16px; border-bottom: 1px solid var(--line); color: var(--muted); font-family: var(--font-geist-mono), monospace; font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .execution-detail { border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -158,10 +181,11 @@ td small { margin-top: 5px; color: var(--muted); font-size: 10px; }
 .step-io-grid article:last-child { border-right: 0; }
 .step-io-grid h5 { display: flex; align-items: center; gap: 7px; margin: 0 0 9px; font-size: 10px; }
 .scenario-inspection { border-top-color: var(--ink); }
-.scenario-overview { display: grid; grid-template-columns: repeat(3, 1fr); border-bottom: 1px solid var(--line); }
+.scenario-overview { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--line); }
 .scenario-overview > div { padding: 14px 18px; border-right: 1px solid var(--line); }
 .scenario-overview > div:last-child { border-right: 0; }
 .scenario-overview strong { font-size: 11px; }
+.scenario-description { margin: 0; padding: 12px 18px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.55; }
 
 .side-stack { display: grid; gap: 24px; }
 .integration-list article { display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--line); background: white; }
@@ -233,6 +257,8 @@ footer { display: flex; justify-content: space-between; margin-top: 24px; paddin
   .metric-card:nth-child(2) { border-right: 0; }
   .metric-card:nth-child(-n+2) { border-bottom: 1px solid var(--ink); }
   .content-grid { grid-template-columns: 1fr; }
+  .analysis-panel { grid-template-columns: 1fr; }
+  .analysis-copy { border-right: 0; border-bottom: 1px solid var(--ink); }
   .side-stack { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 720px) {
@@ -244,6 +270,7 @@ footer { display: flex; justify-content: space-between; margin-top: 24px; paddin
   .service-state { margin: 0; }
   .status-rail a { width: 100%; margin: 2px 0 0; }
   .metrics { grid-template-columns: 1fr 1fr; }
+  .analysis-submit-row { align-items: stretch; flex-direction: column; }
   .metric-card { min-height: 126px; padding: 15px; }
   .metric-card strong { font-size: 31px; }
   .panel-heading { flex-direction: column; }

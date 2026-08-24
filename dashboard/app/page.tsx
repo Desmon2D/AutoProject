@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_ORCHESTRATOR_URL ?? "http://127.0.0.1:8080";
 const REFRESH_INTERVAL = 10_000;
@@ -53,6 +53,7 @@ type Workflow = {
   executions: StepExecution[];
   trigger: { source: string; event: string; event_id: string; data: JsonObject };
   review_comments: string[];
+  pending_review: { provider: "gitea" | "plane"; decision: "review" | "merge" } | null;
   error: { code: string; message: string; retryable: boolean } | null;
   created_at: string;
   updated_at: string;
@@ -67,16 +68,28 @@ type ScenarioStep = {
   provider?: string;
   model?: string;
   timeout_seconds?: number;
+  result_contract?: string;
   command?: string;
   parameters?: JsonObject;
 };
 type Scenario = {
   id: string;
   version: string;
+  stage: "analysis" | "development" | "testing" | "bug-finding" | "operations" | "system";
+  title: string | null;
+  description: string | null;
   enabled: boolean;
   trigger: { source: string; event: string };
   start_step: string;
   steps: Record<string, ScenarioStep>;
+};
+const scenarioStageLabels: Record<Scenario["stage"], string> = {
+  analysis: "Аналитика",
+  development: "Разработка",
+  testing: "Тестирование",
+  "bug-finding": "Поиск ошибок",
+  operations: "Операции",
+  system: "Системный",
 };
 type Extension = { name: string; version: string; enabled: boolean; mandatory?: boolean };
 type ImageProfile = {
@@ -167,6 +180,32 @@ function JsonBlock({ value, empty = "Нет данных" }: { value: unknown; e
   return <pre className="json-block">{JSON.stringify(redactForDisplay(value), null, 2)}</pre>;
 }
 
+function artifactHref(executionId: string, uri: string): string | null {
+  const prefix = `artifact://${executionId}/`;
+  if (uri.startsWith(prefix)) {
+    const path = uri.slice(prefix.length).split("/").map(encodeURIComponent).join("/");
+    return `${API_BASE}/v1/agent-steps/${encodeURIComponent(executionId)}/artifacts/${path}`;
+  }
+  return uri.startsWith("http://") || uri.startsWith("https://") ? uri : null;
+}
+
+function ArtifactLinks({ execution }: { execution: StepExecution }) {
+  const links = execution.artifacts
+    .map((artifact) => ({ artifact, href: artifactHref(execution.execution_id, artifact.uri) }))
+    .filter((item): item is { artifact: Artifact; href: string } => item.href !== null);
+  if (links.length === 0) return null;
+  return (
+    <div className="artifact-links">
+      {links.map(({ artifact, href }) => (
+        <a key={`${artifact.type}:${artifact.uri}`} href={href} target="_blank" rel="noreferrer">
+          <span>{artifact.type === "document" ? "Открыть документ" : "Открыть артефакт"}</span>
+          <small>{artifact.summary ?? artifact.uri}</small>
+        </a>
+      ))}
+    </div>
+  );
+}
+
 function ServiceState({ state, label }: { state: IndicatorState; label: string }) {
   return <span className={`service-state is-${state}`}><span className="service-dot" aria-hidden="true" />{label}</span>;
 }
@@ -207,6 +246,9 @@ function WorkflowDetails({
 }) {
   const [actionNote, setActionNote] = useState("");
   const canReview = workflow.status === "WAITING";
+  const isDevelopmentReview = canReview
+    && workflow.pending_review?.provider === "plane"
+    && scenario?.stage === "development";
   const canCancel = ["CREATED", "RUNNING", "WAITING"].includes(workflow.status);
   const canRetry = workflow.status === "FAILED";
   const hasActions = canReview || canCancel || canRetry;
@@ -226,6 +268,7 @@ function WorkflowDetails({
       </div>
       {hasActions && (
         <section className="workflow-actions" aria-label="Действия с процессом">
+          {isDevelopmentReview && <p className="action-context">Решение синхронизируется с Plane: одобрение запускает этап тестирования, возврат создаёт следующую итерацию разработки.</p>}
           <label htmlFor={`action-note-${workflow.id}`}>Комментарий или причина</label>
           <textarea
             id={`action-note-${workflow.id}`}
@@ -236,8 +279,8 @@ function WorkflowDetails({
             disabled={actionBusy}
           />
           <div className="workflow-action-buttons">
-            {canReview && <button type="button" className="action-button action-approve" disabled={actionBusy} onClick={() => void onAction("approve", actionNote)}>Одобрить</button>}
-            {canReview && <button type="button" className="action-button" disabled={actionBusy} onClick={() => void onAction("request_changes", actionNote)}>На доработку</button>}
+            {canReview && <button type="button" className="action-button action-approve" disabled={actionBusy} onClick={() => void onAction("approve", actionNote)}>{isDevelopmentReview ? "Передать в тестирование" : "Одобрить"}</button>}
+            {canReview && <button type="button" className="action-button" disabled={actionBusy} onClick={() => void onAction("request_changes", actionNote)}>{isDevelopmentReview ? "Вернуть в разработку" : "На доработку"}</button>}
             {canRetry && <button type="button" className="action-button action-approve" disabled={actionBusy} onClick={() => void onAction("retry", actionNote)}>Повторить</button>}
             {canCancel && <button type="button" className="action-button action-danger" disabled={actionBusy} onClick={() => void onAction("cancel", actionNote)}>Отменить</button>}
           </div>
@@ -261,7 +304,7 @@ function WorkflowDetails({
             <div className="execution-meta"><span>Итерация {execution.iteration}</span><span>Попытка {execution.attempt}</span><span>{execution.execution_status}</span></div>
             <div className="step-io-grid">
               <article><h5><span className="io-direction">IN</span>Вход шага</h5><JsonBlock value={executionInput(workflow, scenario, execution, index)} /></article>
-              <article><h5><span className="io-direction output">OUT</span>Выход шага</h5><JsonBlock value={{ data: execution.data, artifacts: execution.artifacts, error: execution.error }} /></article>
+              <article><h5><span className="io-direction output">OUT</span>Выход шага</h5><JsonBlock value={{ data: execution.data, artifacts: execution.artifacts, error: execution.error }} /><ArtifactLinks execution={execution} /></article>
             </div>
           </details>
         ))}
@@ -275,14 +318,16 @@ function ScenarioDetails({ scenario, onClose }: { scenario: Scenario; onClose: (
   return (
     <section className="inspection-panel scenario-inspection" aria-label={`Детали сценария ${scenario.id}`}>
       <div className="inspection-header">
-        <div><p className="eyebrow">SCENARIO DEFINITION</p><h3>{scenario.id} <span className="mono">v{scenario.version}</span></h3></div>
+        <div><p className="eyebrow">SCENARIO DEFINITION</p><h3>{scenario.title ?? scenario.id} <span className="mono">v{scenario.version}</span></h3><small>{scenario.id}</small></div>
         <button type="button" className="close-button" onClick={onClose}>Закрыть ×</button>
       </div>
       <div className="scenario-overview">
         <div><small>Trigger</small><strong>{scenario.trigger.source} / {scenario.trigger.event}</strong></div>
+        <div><small>Этап</small><strong>{scenarioStageLabels[scenario.stage]}</strong></div>
         <div><small>Стартовый шаг</small><strong>{scenario.start_step}</strong></div>
         <div><small>Состояние</small><strong>{scenario.enabled ? "включён" : "выключен"}</strong></div>
       </div>
+      {scenario.description && <p className="scenario-description">{scenario.description}</p>}
       <div className="execution-list">
         <div className="section-label">Определения шагов · {Object.keys(scenario.steps).length}</div>
         {Object.entries(scenario.steps).map(([stepId, step], index) => {
@@ -316,6 +361,13 @@ export default function Dashboard() {
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
   const [selectedScenarioId, setSelectedScenarioId] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
+  const [analysisTitle, setAnalysisTitle] = useState("");
+  const [analysisRequest, setAnalysisRequest] = useState("");
+  const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [analysisFeedback, setAnalysisFeedback] = useState<{
+    kind: "success" | "error";
+    message: string;
+  } | null>(null);
   const [actionFeedback, setActionFeedback] = useState<{
     workflowId: string;
     kind: "success" | "error";
@@ -392,6 +444,42 @@ export default function Dashboard() {
     }
   }, [load]);
 
+  const submitAnalysis = useCallback(async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const request = analysisRequest.trim();
+    if (request.length < 3) {
+      setAnalysisFeedback({ kind: "error", message: "Опишите аналитическую задачу." });
+      return;
+    }
+    setAnalysisBusy(true);
+    setAnalysisFeedback(null);
+    try {
+      const workflow = await postJson<Workflow>("/v1/analysis", {
+        request,
+        ...(analysisTitle.trim() ? { title: analysisTitle.trim() } : {}),
+      });
+      setSnapshot((current) => current ? {
+        ...current,
+        workflows: [workflow, ...current.workflows.filter((item) => item.id !== workflow.id)],
+      } : current);
+      setSelectedWorkflowId(workflow.id);
+      setAnalysisRequest("");
+      setAnalysisTitle("");
+      setAnalysisFeedback({
+        kind: "success",
+        message: "Аналитическая задача поставлена в очередь.",
+      });
+      await load();
+    } catch (reason) {
+      setAnalysisFeedback({
+        kind: "error",
+        message: reason instanceof Error ? reason.message : "Не удалось создать задачу",
+      });
+    } finally {
+      setAnalysisBusy(false);
+    }
+  }, [analysisRequest, analysisTitle, load]);
+
   const workflows = snapshot?.workflows ?? [];
   const visibleWorkflows = workflows.filter((item) => filter === "ALL" || item.status === filter);
   const active = workflows.filter((item) => ["CREATED", "RUNNING", "WAITING"].includes(item.status)).length;
@@ -436,6 +524,25 @@ export default function Dashboard() {
         <ServiceState state={snapshot?.health.providers.plane.configured ? "ready" : "idle"} label="Plane" />
         <ServiceState state={snapshot?.health.providers.swirl.configured ? "ready" : "idle"} label="SWIRL" />
         <a href="http://127.0.0.1:3000" target="_blank" rel="noreferrer">открыть Gitea ↗</a>
+      </section>
+
+      <section className="panel analysis-panel" aria-labelledby="analysis-heading">
+        <div className="analysis-copy">
+          <p className="eyebrow">АНАЛИТИКА</p>
+          <h2 id="analysis-heading">Новый аналитический документ</h2>
+          <p>Опишите задачу. Агент изучит доступную документацию и подготовит Markdown-файл.</p>
+        </div>
+        <form className="analysis-form" onSubmit={(event) => void submitAnalysis(event)}>
+          <label htmlFor="analysis-title">Название документа <span>необязательно</span></label>
+          <input id="analysis-title" value={analysisTitle} onChange={(event) => setAnalysisTitle(event.target.value)} maxLength={300} placeholder="Например: Требования к модулю аналитики" />
+          <label htmlFor="analysis-request">Что нужно изучить и подготовить</label>
+          <textarea id="analysis-request" value={analysisRequest} onChange={(event) => setAnalysisRequest(event.target.value)} minLength={3} maxLength={20_000} required placeholder="Изучи документацию по процессу обработки заявок и составь функциональные и нефункциональные требования…" />
+          <div className="analysis-submit-row">
+            <small>Результат появится в деталях workflow как документ .md</small>
+            <button type="submit" disabled={analysisBusy || analysisRequest.trim().length < 3}>{analysisBusy ? "Создаём…" : "Запустить анализ"}</button>
+          </div>
+          {analysisFeedback && <p className={`analysis-feedback is-${analysisFeedback.kind}`} role="status">{analysisFeedback.message}</p>}
+        </form>
       </section>
 
       <section className="metrics" aria-label="Сводка">
@@ -515,7 +622,7 @@ export default function Dashboard() {
           <div className="catalog-list">
             {snapshot?.scenarios.map((scenario, index) => (
               <button type="button" className={selectedScenarioId === scenario.id ? "is-selected" : ""} key={scenario.id} aria-expanded={selectedScenarioId === scenario.id} onClick={() => setSelectedScenarioId(selectedScenarioId === scenario.id ? null : scenario.id)}>
-                <span className="catalog-index">{String(index + 1).padStart(2, "0")}</span><span><strong>{scenario.id}</strong><small>{scenario.trigger.source} / {scenario.trigger.event}</small></span><span>{Object.keys(scenario.steps).length} шаг.</span><span className="catalog-action">{selectedScenarioId === scenario.id ? "скрыть" : "детали"}</span>
+                <span className="catalog-index">{String(index + 1).padStart(2, "0")}</span><span><strong>{scenario.title ?? scenario.id}</strong><small>{scenarioStageLabels[scenario.stage]} · {scenario.id}</small></span><span>{Object.keys(scenario.steps).length} шаг.</span><span className="catalog-action">{selectedScenarioId === scenario.id ? "скрыть" : "детали"}</span>
               </button>
             ))}
             {snapshot?.scenarios.length === 0 && <div className="empty-inline">Нет сценариев</div>}

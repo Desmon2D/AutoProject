@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from .models import ScenarioManifest, TriggerEvent, WorkflowInstance
@@ -14,6 +15,37 @@ class WorkflowStore:
     def workflow_id(scenario: ScenarioManifest, event: TriggerEvent) -> str:
         source = f"{scenario.id}\0{event.source}\0{event.event}\0{event.event_id}"
         return f"wf-{hashlib.sha256(source.encode('utf-8')).hexdigest()[:24]}"
+
+    @staticmethod
+    def scenario_digest(scenario: ScenarioManifest) -> str:
+        canonical = json.dumps(
+            scenario.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def save_scenario_snapshot(self, workflow_id: str, scenario: ScenarioManifest) -> str:
+        directory = self.root / workflow_id
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / "scenario.json"
+        digest = self.scenario_digest(scenario)
+        if target.is_file():
+            stored = ScenarioManifest.model_validate_json(target.read_text(encoding="utf-8"))
+            if self.scenario_digest(stored) != digest:
+                raise RuntimeError("workflow scenario snapshot is immutable")
+            return digest
+        temporary = directory / "scenario.json.tmp"
+        temporary.write_text(scenario.model_dump_json(indent=2), encoding="utf-8")
+        temporary.replace(target)
+        return digest
+
+    def get_scenario_snapshot(self, workflow_id: str) -> ScenarioManifest | None:
+        path = self.root / workflow_id / "scenario.json"
+        if not path.is_file():
+            return None
+        return ScenarioManifest.model_validate_json(path.read_text(encoding="utf-8"))
 
     def get(self, workflow_id: str) -> WorkflowInstance | None:
         path = self.root / workflow_id / "workflow.json"

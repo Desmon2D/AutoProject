@@ -112,15 +112,62 @@ $search = Invoke-RestMethod `
     -Uri "http://127.0.0.1:8083/api/swirl/search/?qs=$queryString&providers=bookstack&result_count=5" `
     -Headers $headers `
     -TimeoutSec 90
-$results = @($search.results | ForEach-Object { @($_.json_results) })
+$results = @()
+foreach ($item in @($search.results)) {
+    if ($item.json_results) { $results += @($item.json_results) }
+    else { $results += $item }
+}
 if (-not $search.info.search.id -or $results.Count -eq 0) {
     throw "SWIRL returned no BookStack results"
 }
+
+$firstResult = $results | Where-Object { $_.payload.id } | Select-Object -First 1
+if (-not $firstResult) { throw "SWIRL BookStack result has no document id" }
+$catalog = Invoke-RestMethod `
+    -Uri "http://127.0.0.1:8083/api/swirl/searchproviders/" `
+    -Headers $headers `
+    -TimeoutSec 30
+$provider = $null
+foreach ($candidate in $catalog) {
+    if ($candidate.name -eq "Local BookStack") {
+        $provider = $candidate
+        break
+    }
+}
+$route = $provider.page_fetch_config_json.automation_content
+if (-not $provider -or -not $route.url_template -or -not $route.content_path) {
+    throw "SWIRL BookStack provider has no full-content route"
+}
+$safeRoutes = ConvertTo-Json -InputObject @(
+    [ordered]@{
+        source = [string]$provider.name
+        provider_id = [int]$provider.id
+        url_template = [string]$route.url_template
+        content_path = [string]$route.content_path
+        format = [string]$route.format
+    }
+) -Compress
+Set-DotEnvValue "SWIRL_CONTENT_ALLOWED_ORIGINS" "http://bookstack"
+Set-DotEnvValue "SWIRL_CONTENT_ROUTES_JSON" $safeRoutes
+$documentUrl = $route.url_template.Replace(
+    "{id}",
+    [Uri]::EscapeDataString([string]$firstResult.payload.id)
+)
+$fetchUrl = "http://127.0.0.1:8083/api/swirl/fetch-document/?url=$([Uri]::EscapeDataString($documentUrl))&provider_id=$($provider.id)"
+$document = Invoke-RestMethod -Uri $fetchUrl -Headers $headers -TimeoutSec 30
+$content = $document.($route.content_path)
+if ($content -isnot [string] -or $content.Length -lt 100) {
+    throw "SWIRL returned no substantive BookStack document content"
+}
+
+& $docker compose up -d --no-deps --force-recreate orchestrator worker
+if ($LASTEXITCODE -ne 0) { throw "Cannot apply the safe SWIRL content route" }
 
 [pscustomobject]@{
     BookStack = "http://127.0.0.1:8082"
     Provider = "Local BookStack"
     SearchId = $search.info.search.id
     Results = $results.Count
+    FetchedCharacters = $content.Length
     TokenStored = $true
 } | Format-List

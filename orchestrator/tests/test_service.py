@@ -126,6 +126,8 @@ def test_swirl_environment_is_scoped(image_resolver, monkeypatch, tmp_path: Path
     monkeypatch.setenv("SWIRL_BASE_URL", "http://swirl:8000")
     monkeypatch.setenv("SWIRL_USERNAME", "agent")
     monkeypatch.setenv("SWIRL_PASSWORD", "swirl-secret")
+    monkeypatch.setenv("SWIRL_CONTENT_ALLOWED_ORIGINS", "http://bookstack")
+    monkeypatch.setenv("SWIRL_CONTENT_ROUTES_JSON", "[]")
     monkeypatch.setenv("GITEA_TOKEN", "must-not-pass")
 
     environment = SandboxManager(tmp_path)._environment(resolution)
@@ -135,4 +137,6 @@ def test_swirl_environment_is_scoped(image_resolver, monkeypatch, tmp_path: Path
         "SWIRL_BASE_URL": "http://swirl:8000",
         "SWIRL_USERNAME": "agent",
         "SWIRL_PASSWORD": "swirl-secret",
+        "SWIRL_CONTENT_ALLOWED_ORIGINS": "http://bookstack",
+        "SWIRL_CONTENT_ROUTES_JSON": "[]",
     }

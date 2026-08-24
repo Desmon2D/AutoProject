@@ -60,6 +60,8 @@ def normalize_plane_webhook(
     ready_state_names: set[str],
     testing_state_ids: set[str] | None = None,
     testing_state_names: set[str] | None = None,
+    cancelled_state_ids: set[str] | None = None,
+    cancelled_state_names: set[str] | None = None,
 ) -> PlaneWebhookResult:
     event = str(payload.get("event", "")).strip().casefold()
     action = str(payload.get("action", "")).strip().casefold()
@@ -79,6 +81,12 @@ def normalize_plane_webhook(
     state_ids, state_names = _state_values(data)
     testing_state_ids = testing_state_ids or set()
     testing_state_names = testing_state_names or set()
+    cancelled_state_ids = cancelled_state_ids or set()
+    cancelled_state_names = cancelled_state_names or set()
+    configured_cancelled = bool(
+        state_ids.intersection(cancelled_state_ids)
+        or state_names.intersection(cancelled_state_names)
+    )
     explicitly_testing = data.get("ready_for_testing") is True or data.get("testing") is True
     configured_testing = bool(
         state_ids.intersection(testing_state_ids)
@@ -88,7 +96,9 @@ def normalize_plane_webhook(
     configured_ready = bool(
         state_ids.intersection(ready_state_ids) or state_names.intersection(ready_state_names)
     )
-    if explicitly_testing or configured_testing:
+    if configured_cancelled:
+        trigger_event = "issue.cancelled"
+    elif explicitly_testing or configured_testing:
         trigger_event = "issue.testing"
     elif explicitly_ready or configured_ready:
         trigger_event = "issue.ready_for_development"
@@ -113,8 +123,17 @@ def normalize_plane_webhook(
             "Plane task repository does not match its allowed project repository"
         )
     repository = task_repository or mapped_repository
-    if repository is None:
-        raise PlaneWebhookError("Plane project has no Gitea repository mapping")
+    repository_source = (
+        "description_marker"
+        if task_repository is not None
+        else "project_mapping"
+        if mapped_repository is not None
+        else "unresolved"
+    )
+    plain_description = _plain_text(description)
+    search_query = (
+        f"{summary}. {plain_description}" if plain_description else summary
+    )[:2000]
     webhook_id = str(payload.get("webhook_id", "")).strip()
     changed_at = _first_text(data, "updated_at", "created_at") or "unknown"
     stable_source = f"{webhook_id}:{trigger_event}:{action}:{issue_id}:{changed_at}"
@@ -125,6 +144,7 @@ def normalize_plane_webhook(
             "sequence_id": data.get("sequence_id"),
             "summary": summary[:2000],
             "description": description[:20_000] if description else None,
+            "search_query": search_query,
             "priority": data.get("priority"),
             "state_ids": sorted(state_ids),
             "state_names": sorted(state_names),
@@ -138,6 +158,7 @@ def normalize_plane_webhook(
         "repository": {
             "full_name": repository,
             "implementation_ref": implementation_ref,
+            "selection_source": repository_source,
         },
         "plane": {
             "delivery": delivery,
@@ -245,3 +266,10 @@ def _automation_source(description: str | None) -> tuple[str | None, str | None]
         repository_match.group(1) if repository_match else None,
         implementation_ref,
     )
+
+
+def _plain_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    plain = html.unescape(re.sub(r"<[^>]{1,500}>", " ", value))
+    return " ".join(plain.split())

@@ -18,6 +18,7 @@ def request(prompt: str = "Do work") -> AgentRunRequest:
 def test_job_store_caches_result_and_rejects_execution_id_collision(tmp_path: Path):
     store = JobStore(tmp_path)
     assert store.begin(request()) is None
+    assert store.get_request("exec-1") == request()
     result = StepResult(
         step_id="agent",
         execution_id="exec-1",

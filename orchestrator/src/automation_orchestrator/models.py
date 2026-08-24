@@ -64,7 +64,15 @@ class WorkflowContext(StrictModel):
     scenario: dict[str, Any] = Field(default_factory=dict)
     previous_steps: list[PreviousStepResult] = Field(default_factory=list, max_length=100)
     review_comments: list[str] = Field(default_factory=list, max_length=100)
+    retrieval_summary: dict[str, Any] = Field(default_factory=dict)
     swirl_results: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+
+
+class SwirlContentExcerpt(StrictModel):
+    heading: str | None = Field(default=None, max_length=500)
+    text: str = Field(min_length=1, max_length=4000)
+    relevance_score: float = Field(ge=0)
+    matched_terms: list[str] = Field(default_factory=list, max_length=40)
 
 
 class SwirlSearchResult(StrictModel):
@@ -72,6 +80,14 @@ class SwirlSearchResult(StrictModel):
     snippet: str = Field(default="", max_length=2000)
     url: str = Field(min_length=1, max_length=4000)
     source: str = Field(default="unknown", max_length=300)
+    document_id: str | None = Field(default=None, max_length=500)
+    content: str | None = Field(default=None, max_length=50_000)
+    excerpts: list[SwirlContentExcerpt] = Field(default_factory=list, max_length=20)
+    content_fetched: bool = False
+    content_format: str | None = Field(default=None, max_length=50)
+    content_truncated: bool = False
+    retrieval_score: float | None = Field(default=None, ge=0)
+    matched_queries: list[str] = Field(default_factory=list, max_length=20)
     updated_at: str | None = Field(default=None, max_length=100)
     score: float | None = None
 
@@ -87,11 +103,30 @@ class SwirlContextSearch(StrictModel):
     query_field: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]{1,200}$")
     providers: list[str] = Field(default_factory=list, max_length=20)
     max_results: int = Field(default=8, ge=1, le=20)
+    fallback_on_empty: bool = False
+    max_fallback_queries: int = Field(default=6, ge=1, le=12)
+    expand_query: bool = False
+    rank_fusion_k: int = Field(default=60, ge=1, le=200)
+    focused_query_weight: float = Field(default=1.5, ge=0.1, le=5)
+    fetch_content: bool = False
+    max_content_documents: int = Field(default=5, ge=1, le=10)
+    max_content_characters: int = Field(default=50_000, ge=1000, le=50_000)
+    min_content_documents: int = Field(default=1, ge=1, le=10)
+    max_context_characters: int = Field(default=12_000, ge=2000, le=30_000)
+    max_chunk_characters: int = Field(default=2000, ge=500, le=4000)
+    max_chunks_per_document: int = Field(default=2, ge=1, le=5)
+    max_context_results: int = Field(default=8, ge=1, le=20)
+    max_snippet_characters: int = Field(default=600, ge=100, le=2000)
+    min_chunk_relevance: float = Field(default=1.0, ge=0, le=1000)
 
     @model_validator(mode="after")
     def validate_query_source(self):
         if (self.query is None) == (self.query_field is None):
             raise ValueError("context_search requires exactly one of query or query_field")
+        if self.min_content_documents > self.max_content_documents:
+            raise ValueError(
+                "min_content_documents cannot exceed max_content_documents"
+            )
         return self
 
 
@@ -393,6 +428,7 @@ class AgentScenarioStep(ScenarioStepBase):
         "implementation_change",
         "test_change",
         "test_execution",
+        "markdown_document",
     ] = "none"
 
     @field_validator("plugins")
@@ -413,7 +449,7 @@ class CommandScenarioStep(ScenarioStepBase):
 
 class ReviewScenarioStep(ScenarioStepBase):
     type: Literal["review"]
-    provider: Literal["gitea"] = "gitea"
+    provider: Literal["gitea", "plane"] = "gitea"
     decision: Literal["review", "merge"] = "review"
 
 
@@ -426,6 +462,16 @@ ScenarioStep = Annotated[
 class ScenarioManifest(StrictModel):
     id: str
     version: str = "1"
+    stage: Literal[
+        "analysis",
+        "development",
+        "testing",
+        "bug-finding",
+        "operations",
+        "system",
+    ] = "system"
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    description: str | None = Field(default=None, min_length=1, max_length=1000)
     trigger: ScenarioTrigger
     start_step: str
     steps: dict[str, ScenarioStep]
@@ -470,6 +516,16 @@ class TriggerEvent(StrictModel):
         return value
 
 
+class AnalysisRequest(StrictModel):
+    request: str = Field(min_length=3, max_length=20_000)
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+
+    @field_validator("request", "title", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class IgnoredWebhook(StrictModel):
     accepted: Literal[False] = False
     reason: str = Field(min_length=1, max_length=1000)
@@ -479,7 +535,7 @@ class PendingReview(StrictModel):
     step_id: str
     execution_id: str
     iteration: int
-    provider: Literal["gitea"] = "gitea"
+    provider: Literal["gitea", "plane"] = "gitea"
     decision: Literal["review", "merge"] = "review"
     repository: str | None = Field(default=None, max_length=300)
     pull_index: int | None = Field(default=None, ge=1)
@@ -515,6 +571,7 @@ class WorkflowInstance(StrictModel):
     id: str
     scenario_id: str
     scenario_version: str
+    scenario_snapshot_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     trigger: TriggerEvent
     status: Literal["CREATED", "RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED"]
     outcome: Literal["SUCCESS", "FAILURE"] | None = None

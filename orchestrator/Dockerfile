@@ -23,6 +23,7 @@ COPY skills ./skills
 COPY capabilities ./capabilities
 COPY image-catalog ./image-catalog
 COPY scenarios ./scenarios
+COPY evals ./evals
 COPY tests ./tests
 
 RUN groupadd --gid 10001 orchestrator \

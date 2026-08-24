@@ -33,6 +33,10 @@ jq --arg public_url "$swirl_public_url" '
     | .oidcConfig.Google.redirectUri = ($public_url + "/galaxy/oidc-callback")
 ' /app/config-swirl-demo.db.json > /app/static/api/config/default
 
+# A marker can be baked into the upstream image or survive a stopped process.
+# Container startup guarantees that none of its recorded PIDs can still belong
+# to this SWIRL instance.
+rm -f /app/.swirl
 if [ "${SWIRL_ENABLE_BEAT:-false}" = "true" ]; then
     python swirl.py --no-version-check start celery-worker celery-beats
 else

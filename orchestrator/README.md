@@ -103,6 +103,8 @@ Main endpoints:
 - `GET /v1/capabilities` — available runtime capabilities;
 - `GET /v1/images` — prepared sandbox image profiles;
 - `GET /v1/scenarios` — validated workflow graph catalog;
+- `POST /v1/analysis` — enqueue a documentation analysis request that must produce a validated
+  Markdown artifact;
 - `POST /v1/triggers` — idempotently create and enqueue a workflow (`202 Accepted`);
 - `GET /v1/workflows/{workflow_id}` — persisted workflow state and execution history;
 - `POST /v1/workflows/{workflow_id}/review` — resolve and re-enqueue a waiting review;
@@ -165,18 +167,12 @@ Verify the native plugin from a generated DeepSeek Harness image with:
 The external volumes are a deliberate dependency of this development workspace.
 On a new machine, restore or create equivalent rootless Gitea volumes first.
 
-`start-dev-gitea.ps1` also creates or updates the repository push webhook. Its
-secret is generated once, stored in the ignored `.env`, and passed to the
-orchestrator. Deliveries are verified against `X-Gitea-Signature` before JSON is
-parsed. The webhook returns `202 Accepted` after persisting an idempotent workflow
-and enqueueing its identifier. The separate `worker` container then runs the agent,
-so Gitea and the dashboard are not blocked by model latency.
-
-The `gitea-push` scenario uses OpenRouter `openai/gpt-4.1-nano` to summarize ordinary
-normalized push events through the mandatory `step-result` tool. Pushes to
-`refs/heads/automation/*` are ignored because their parent workflow already tracks them; this
-prevents duplicate dashboard entries and model calls. Commit messages are explicitly treated as
-untrusted data.
+`start-dev-gitea.ps1` also creates or updates the repository webhook for pull-request
+and review lifecycle events. Its secret is generated once, stored in the ignored `.env`,
+and passed to the orchestrator. Deliveries are verified against `X-Gitea-Signature`
+before JSON is parsed. Ordinary push events are intentionally ignored and never create
+a workflow or model call; development and testing branches are tracked by their parent
+workflows.
 
 The queue is a SQLite database in the shared persistent `/data` volume. A worker
 claims one workflow with a renewable lease. After a worker crash the lease expires
@@ -203,6 +199,17 @@ delivery is idempotent by scenario, source, event, and external event ID. The en
 persists workflow state, step iterations, retry attempts, review comments, and
 normalized Step Results under `/data/jobs/workflows`.
 
+At creation time the exact validated scenario manifest is stored as an immutable
+`scenario.json` snapshot beside the workflow and linked by a SHA-256 digest. A waiting or
+retrying workflow therefore continues on its original graph after a newer scenario version is
+deployed. Legacy workflows without a snapshot are adopted only while their exact catalog version
+is still available; the engine refuses to guess a changed graph.
+
+The implementation is split by responsibility: `workflow_engine.py` coordinates lifecycle and
+persistence, `workflow_commands.py` executes the allowlisted command vocabulary,
+`workflow_plane.py` enriches testing events with implementation revisions, and
+`workflow_validation.py` enforces agent result contracts.
+
 Each step attempt persists its lifecycle (`PENDING`, `READY`, `RUNNING`, `WAITING`,
 `COMPLETED`, `ERROR`, or `CANCELLED`) together with a timestamped status history. A technical
 `ERROR` can schedule another attempt according to the scenario retry policy. The worker returns
@@ -228,31 +235,70 @@ retry is allowed only from `FAILED` and creates a fresh overall deadline.
 The orchestrator is trusted infrastructure and needs access to the Docker socket.
 Agent containers do not receive that socket.
 
+The deterministic test runner adds machine-readable reporting for direct Pytest (JUnit), Jest
+(JSON), Go (`-json`), and .NET (TRX) invocations. Recognized textual reports from Python unittest,
+Node TAP, and common framework summaries remain supported as a fallback. Exit code zero without
+evidence that at least one test executed is `TEST_CODE_ERROR`, never a passing quality gate.
+
+## Analysis document workflow
+
+`POST /v1/analysis` starts the `analysis-document` scenario from a user request and an optional
+title. The engine issues the full request plus focused topic queries to BookStack through SWIRL,
+merges the lists with weighted reciprocal rank fusion, and fetches full document text for a larger
+candidate set. The first meaningful positive request sentence defines the primary topic; negative
+directives are excluded from retrieval terms. It splits Markdown by headings and paragraphs,
+prioritizes documents and chunks with direct primary-topic evidence, preserves source diversity,
+and packs them into a bounded context with separate primary-topic coverage. The agent
+can fetch full text by source and document identifier when surrounding detail is needed. A successful result must write `/output/analysis.md`, return the `markdown_document`
+contract, and expose a canonical `artifact://<execution_id>/analysis.md` reference. The engine
+rejects missing, unsafe, non-UTF-8, oversized, non-substantive, or uncited documents as technical
+errors. A successful document must also cite at least one retrieved source covering the primary
+topic. Run the live retrieval regression set without a model with
+`python -m automation_orchestrator.retrieval_eval evals/bookstack-retrieval.json`.
+
 ## Ticket implementation workflow
 
 The `plane.issue.ready_for_development` trigger starts the `implement-ticket` scenario. The
-signed Plane webhook normalizes a ready issue and maps its project to an allowed Gitea repository.
-The scenario performs a bounded SWIRL context search and runs the delivery agent with Git, Gitea,
-and SWIRL. The agent pushes `automation/<workflow_id>` and returns its exact commit without
-creating a pull request. The workflow records `plane_recommendation=move_to_testing`.
+signed Plane webhook normalizes a ready issue. Add the root repository URL, for example
+`http://localhost:3000/team/service`, to the work item's built-in Links section. The URL must point
+to the configured `GITEA_PUBLIC_BASE_URL`, and the repository must be present in
+`GITEA_ALLOWED_REPOSITORIES`. When the work item has no repository link, the orchestrator falls
+back to `PLANE_PROJECT_REPOSITORIES`; the legacy repository marker in the description remains
+supported for compatibility.
+
+The scenario searches SWIRL with the ticket summary and description, fetches and ranks the most
+relevant documentation, and passes a bounded context to the delivery agent. The ticket defines
+scope, while the selected Gitea repository defines the current code, tests, conventions, and
+dependency constraints. The agent checks the complete requirement list, implements the smallest
+coherent change, runs repository checks, validates the final diff, and pushes
+`automation/<workflow_id>`. The orchestrator verifies the exact remote commit and stores repository,
+branch, and commit links in Plane without creating a pull request.
+
+The Plane lifecycle is `Ready for development` → `In development` → `Development review` →
+`Testing`. At `Development review`, the implementation workflow is `WAITING`. Approval in Plane or
+the dashboard moves the issue to `Testing`, completes `implement-ticket`, and triggers
+`test-ticket`. Returning the issue to `Ready for development` resumes the same implementation
+workflow with refreshed ticket data and review comments; its next iteration moves the issue back
+to `In development`. Moving an active issue to `Cancelled` cancels its workflow.
 
 ## Ticket testing workflow
 
-The `plane.issue.testing` trigger starts the `test-ticket` scenario. The repository is always
-derived from the allowed Plane project mapping and must not be duplicated in the issue
-description. When the same issue previously completed `implement-ticket`, the orchestrator
+The `plane.issue.testing` trigger starts the `test-ticket` scenario. Repository resolution uses
+the same validated Plane link and project-mapping fallback as development. When the same issue
+previously completed `implement-ticket`, the orchestrator
 automatically supplies that workflow's exact branch and commit. For a standalone testing issue
 without a preceding implementation workflow, add two structured Plane links titled
 `Рабочая ветка: branch` and `Коммит реализации: full-40-character-hash`. The legacy
 `Automation implementation ref: branch` description marker remains supported for older tasks.
-Its two agent roles are strictly separated:
+Test authoring and execution are strictly separated:
 
 1. `write-tests` reads the Plane requirements and the implementation at the supplied exact
    commit when available, writes only test code, and pushes one stable `automation/<workflow_id>` branch without
    executing tests or creating a pull request;
-2. `execute-tests` checks out the exact commit returned by the author, cannot edit repository
-   files, runs the project test command, and returns a structured `PASSED`, `PRODUCT_FAILURE`, or
-   `TEST_CODE_ERROR` report;
+2. the orchestrator verifies that the reported branch head descends from the exact implementation
+   commit, downloads that immutable commit, and runs the declared argument-array command in a
+   separate read-only, credential-free container with no network access. Its exit code and output
+   are authoritative rather than model-reported;
 3. after `PASSED`, the orchestrator creates one final pull request from that exact tested branch
    to the repository default branch and enters `WAITING`;
 4. merging the pull request completes the workflow successfully, while closing it without merge
@@ -261,15 +307,18 @@ Its two agent roles are strictly separated:
 
 Invalid test code may return to the author once. No pull request is created for invalid tests or a
 product failure. Every final result is written to the Plane issue as an idempotent comment. A
-product failure returns the issue to `Ready for development`, a merged final pull moves it to the
-configured completed state, and a pull closed without merge moves it to the configured cancelled
-state. A successful implementation records its exact branch and commit but leaves the state
-unchanged so that the user controls when testing starts.
+product failure returns the issue to `Ready for development` and carries the tested branch, exact
+commit, command, and failure output into the next implementation workflow. Rework therefore
+continues on top of the failed tested revision rather than restarting from the default branch. A
+merged final pull moves the issue to the configured completed state, and a pull closed without
+merge moves it to the configured cancelled state. A successful implementation waits in
+`Development review`, so automated testing cannot start until a person approves the transition.
 
-The Community edition used locally does not expose arbitrary custom work-item fields. The branch
-and commit therefore use Plane's built-in Links section as two separately visible structured
-values. Their URLs open the exact Gitea branch and commit. When an external developer supplies
-both links and moves the issue to `Testing`, the testing workflow reads them through the Plane API.
+The Community edition used locally does not expose arbitrary custom work-item fields. Repository,
+branch, and commit therefore use Plane's built-in Links section as separately visible structured
+values. Their URLs open the Gitea repository and exact revision. When an external developer
+supplies the repository, branch, and commit links and moves the issue to `Testing`, the testing
+workflow reads them through the Plane API.
 
 Configure `PLANE_TESTING_STATE_IDS` or `PLANE_TESTING_STATE_NAMES` (the local default is
 `Testing`). For a local trigger, create a Plane issue directly in that state with:
@@ -279,12 +328,15 @@ Configure `PLANE_TESTING_STATE_IDS` or `PLANE_TESTING_STATE_NAMES` (the local de
 ```
 
 For local development set `PLANE_WEBHOOK_SECRET`, `PLANE_READY_STATE_IDS` or
-`PLANE_READY_STATE_NAMES`, and `PLANE_PROJECT_REPOSITORIES`. The last value is a JSON object whose
-keys are Plane project identifiers or IDs and whose values are Gitea repositories in `owner/name`
-format. Repeated deliveries for the same issue revision reuse the existing workflow.
+`PLANE_READY_STATE_NAMES`, `GITEA_PUBLIC_BASE_URL`, and `GITEA_ALLOWED_REPOSITORIES`.
+`PLANE_PROJECT_REPOSITORIES` is an optional fallback JSON object whose keys are Plane project
+identifiers or IDs and whose values are Gitea repositories in `owner/name` format. Repeated
+deliveries for the same issue revision reuse the existing workflow.
 
 Writing workflow results back requires `PLANE_API_TOKEN`, `PLANE_WORKSPACE_SLUG`,
-`PLANE_COMPLETED_STATE_IDS`, and `PLANE_CANCELLED_STATE_IDS`. The local Plane setup script creates
+`PLANE_IN_DEVELOPMENT_STATE_IDS`, `PLANE_DEVELOPMENT_REVIEW_STATE_IDS`,
+`PLANE_TESTING_STATE_IDS`, `PLANE_COMPLETED_STATE_IDS`, and `PLANE_CANCELLED_STATE_IDS`.
+The local Plane setup script creates
 the token and state mappings and passes them to both the orchestrator and worker. Comment external
 IDs contain the workflow and result, so a safe retry does not create duplicate comments.
 
@@ -308,9 +360,12 @@ worker with its connection settings, and verify the real Search API with:
 
 The UI is available at `http://localhost:8083/galaxy/`. Override `SWIRL_IMAGE`,
 `SWIRL_USERNAME`, and `SWIRL_PASSWORD` in the ignored `.env` when needed. The orchestrator uses
-the internal `http://swirl:8000` URL and synchronous `GET /api/swirl/search/?qs=...`, then limits
-normalized excerpts before adding them to agent context. SWIRL result text is always marked as
-untrusted reference data.
+the internal `http://swirl:8000` URL and synchronous `GET /api/swirl/search/?qs=...`, then resolves
+the provider-owned content route and calls `/api/swirl/fetch-document/`. Both excerpts and bounded
+full text are added to agent context and marked as untrusted reference data. Content URLs must match
+`SWIRL_CONTENT_ALLOWED_ORIGINS`; the local default permits only `http://bookstack`. Runtime uses the
+credential-free provider mapping from `SWIRL_CONTENT_ROUTES_JSON` and never reads the provider
+catalog, whose administrative representation may contain upstream headers.
 
 The development default keeps the optional Celery beat scheduler disabled to avoid loading a
 third copy of SWIRL's NLP stack. Set `SWIRL_ENABLE_BEAT=true` only when testing scheduled searches
@@ -320,8 +375,10 @@ BookStack is the local Confluence replacement and remains behind SWIRL. When
 `BOOKSTACK_BASE_URL`, `BOOKSTACK_TOKEN_ID`, and `BOOKSTACK_TOKEN_SECRET` are configured together,
 the SWIRL startup script idempotently creates or updates the non-default `Local BookStack` search
 provider tagged `bookstack`. The implementation scenario limits its automatic context search to
-that tag. BookStack credentials are passed only to SWIRL, never to the orchestrator or agent
-container. Normal development uses the stored response fixture and does not start either service.
+that tag. The provider exposes a stable document identifier plus a full-content route owned by
+SWIRL. The setup script exports only a sanitized route contract to the orchestrator and agent.
+BookStack credentials are passed only to SWIRL, never to the orchestrator or agent container.
+Normal development uses stored response fixtures and does not start either service.
 
 Return to the low-memory core mode with:
 

@@ -129,6 +129,80 @@ class GiteaClient:
         if remote_id != commit:
             raise GiteaClientError("remote branch does not point to the reported commit")
 
+    def default_branch(self, repository: str) -> str:
+        root = self._repository_root(repository)
+        payload = self._request("GET", root)
+        branch = payload.get("default_branch") if isinstance(payload, dict) else None
+        if not isinstance(branch, str) or not branch:
+            raise GiteaClientError("Gitea repository has no default branch")
+        self._validate_ref(branch)
+        return branch
+
+    def verify_descendant(
+        self,
+        *,
+        repository: str,
+        ancestor: str,
+        descendant: str,
+        max_commits: int = 1000,
+    ) -> None:
+        self._validate_repository(repository)
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", ancestor) or not re.fullmatch(
+            r"[0-9a-fA-F]{40}", descendant
+        ):
+            raise GiteaClientError("ancestry check requires full Git hashes")
+        root = self._repository_root(repository)
+        expected = ancestor.lower()
+        pending = [descendant.lower()]
+        visited: set[str] = set()
+        while pending and len(visited) < max_commits:
+            commit = pending.pop()
+            if commit == expected:
+                return
+            if commit in visited:
+                continue
+            visited.add(commit)
+            payload = self._request("GET", f"{root}/git/commits/{commit}")
+            parents = payload.get("parents") if isinstance(payload, dict) else None
+            if not isinstance(parents, list):
+                raise GiteaClientError("Gitea returned invalid commit ancestry")
+            pending.extend(
+                str(parent.get("sha", "")).lower()
+                for parent in parents
+                if isinstance(parent, dict)
+                and re.fullmatch(r"[0-9a-fA-F]{40}", str(parent.get("sha", "")))
+            )
+        raise GiteaClientError("reported commit is not descended from the required base commit")
+
+    def download_archive(self, *, repository: str, commit: str) -> bytes:
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+            raise GiteaClientError("archive commit must be a full Git hash")
+        root = self._repository_root(repository)
+        return self._request_bytes("GET", f"{root}/archive/{commit}.tar.gz")
+
+    def _repository_root(self, repository: str) -> str:
+        self._validate_repository(repository)
+        owner, name = repository.split("/", 1)
+        return f"/api/v1/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+
+    def _request_bytes(self, method: str, path: str) -> bytes:
+        request = Request(
+            f"{self.base_url}{path}",
+            method=method,
+            headers={
+                "Accept": "application/octet-stream",
+                "Authorization": f"token {self.token}",
+            },
+        )
+        try:
+            with self.opener(request, timeout=self.timeout_seconds) as response:
+                return response.read()
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            raise GiteaClientError(f"Gitea returned HTTP {exc.code}: {detail}") from exc
+        except (URLError, OSError) as exc:
+            raise GiteaClientError(f"Gitea request failed: {exc}") from exc
+
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         payload = json.dumps(body).encode("utf-8") if body is not None else None
         request = Request(

@@ -17,13 +17,26 @@
     "CosineRelevancyResultProcessor"
   ],
   "response_mappings": "FOUND=total,RESULTS=data",
-  "result_mappings": "title=name,body=preview_html.content,date_published=updated_at,url=url,type,book.name,chapter.name,tags[*].name,tags[*].value,NO_PAYLOAD",
+  "result_mappings": "title=name,body=preview_html.content,date_published=updated_at,url=url,id,type,book.name,chapter.name,tags[*].name,tags[*].value,NO_PAYLOAD",
   "results_per_query": 10,
   "credentials": "",
   "eval_credentials": "",
   "http_request_headers": {
     "Accept": "application/json",
     "Authorization": "Token <token-id>:<token-secret>"
+  },
+  "page_fetch_config_json": {
+    "cache": "false",
+    "headers": {
+      "Accept": "application/json",
+      "Authorization": "Token <token-id>:<token-secret>"
+    },
+    "automation_content": {
+      "url_template": "http://bookstack/api/pages/{id}",
+      "content_path": "markdown",
+      "format": "markdown"
+    },
+    "timeout": 10
   },
   "tags": [
     "bookstack"

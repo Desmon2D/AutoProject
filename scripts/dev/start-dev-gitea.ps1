@@ -132,7 +132,7 @@ $existingHook = $hooks | Where-Object { $_.config.url -eq $webhookUrl } | Select
 $hookConfig = @{
     active = $true
     branch_filter = "**"
-    events = @("push", "pull_request", "pull_request_review")
+    events = @("pull_request", "pull_request_review")
     config = @{
         url = $webhookUrl
         content_type = "json"
@@ -157,10 +157,6 @@ else {
         -Body ($hookConfig | ConvertTo-Json -Depth 5)
 }
 
-$workflowResponse = Invoke-RestMethod `
-    -Uri "http://127.0.0.1:8080/v1/workflows" `
-    -TimeoutSec 5
-$workflowIdsBefore = @($workflowResponse | ForEach-Object { $_.id })
 & $docker run --rm `
     --network automation-agent-source `
     --env "GITEA_TOKEN=$token" `
@@ -172,47 +168,6 @@ $workflowIdsBefore = @($workflowResponse | ForEach-Object { $_.id })
     /bootstrap/check-dev-gitea.sh
 if ($LASTEXITCODE -ne 0) { throw "Sandbox cannot reach the Gitea Git source" }
 
-$newWorkflow = $null
-for ($attempt = 1; $attempt -le 30; $attempt++) {
-    $currentWorkflowResponse = Invoke-RestMethod `
-        -Uri "http://127.0.0.1:8080/v1/workflows" `
-        -TimeoutSec 5
-    $currentWorkflows = @($currentWorkflowResponse)
-    $newWorkflow = $currentWorkflows | Where-Object {
-        $_.scenario_id -eq "gitea-push" -and $_.id -notin $workflowIdsBefore
-    } | Select-Object -First 1
-    if ($null -ne $newWorkflow) {
-        break
-    }
-    Start-Sleep -Seconds 1
-}
-if ($null -eq $newWorkflow) { throw "Gitea push webhook was not delivered" }
-
-$completedWorkflow = $null
-for ($attempt = 1; $attempt -le 120; $attempt++) {
-    $candidate = Invoke-RestMethod `
-        -Uri "http://127.0.0.1:8080/v1/workflows/$($newWorkflow.id)" `
-        -TimeoutSec 5
-    if ($candidate.status -in @("COMPLETED", "FAILED", "CANCELLED")) {
-        $completedWorkflow = $candidate
-        break
-    }
-    Start-Sleep -Seconds 2
-}
-if ($null -eq $completedWorkflow) { throw "Gitea agent workflow did not finish in time" }
-if ($completedWorkflow.status -ne "COMPLETED") {
-    throw "Gitea agent workflow finished with status $($completedWorkflow.status): $($completedWorkflow.error.message)"
-}
-$agentExecution = @($completedWorkflow.executions) | Where-Object {
-    $_.step_id -eq "analyze-push"
-} | Select-Object -Last 1
-if ($null -eq $agentExecution -or
-    $agentExecution.execution_status -ne "COMPLETED" -or
-    $agentExecution.outcome -ne "SUCCESS" -or
-    $agentExecution.data.provider -ne "openrouter") {
-    throw "Gitea agent step did not return a successful OpenRouter result"
-}
-
 [pscustomobject]@{
     Gitea = "http://127.0.0.1:3000"
     Repository = $repositoryInfo.html_url
@@ -220,10 +175,6 @@ if ($null -eq $agentExecution -or
     Username = $Username
     TokenConfigured = $true
     WebhookConfigured = $configuredHook.active
-    WebhookDelivered = $true
-    Workflow = $completedWorkflow.id
-    WorkflowStatus = $completedWorkflow.status
-    AgentOutcome = $agentExecution.outcome
-    Provider = $agentExecution.data.provider
-    Model = $agentExecution.data.model
+    WebhookEvents = @($configuredHook.events) -join ", "
+    GitSourceVerified = $true
 } | Format-List

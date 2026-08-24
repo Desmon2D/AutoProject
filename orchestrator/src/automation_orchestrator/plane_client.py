@@ -7,7 +7,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
@@ -15,6 +15,7 @@ REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REF_PATTERN = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 BRANCH_TITLE = "Рабочая ветка: "
 COMMIT_TITLE = "Коммит реализации: "
+REPOSITORY_TITLE = "Рабочий репозиторий: "
 
 
 class PlaneClientError(RuntimeError):
@@ -68,9 +69,16 @@ class PlaneClient:
             token,
             workspace_slug,
             {
+                "development_started": _first_csv("PLANE_IN_DEVELOPMENT_STATE_IDS"),
+                "development_review": _first_csv("PLANE_DEVELOPMENT_REVIEW_STATE_IDS"),
+                "manual_implementation_fix_required": _first_csv(
+                    "PLANE_DEVELOPMENT_REVIEW_STATE_IDS"
+                ),
+                "approved_for_testing": _first_csv("PLANE_TESTING_STATE_IDS"),
                 "return_to_development": _first_csv("PLANE_READY_STATE_IDS"),
                 "accepted": _first_csv("PLANE_COMPLETED_STATE_IDS"),
                 "rejected": _first_csv("PLANE_CANCELLED_STATE_IDS"),
+                "cancelled": _first_csv("PLANE_CANCELLED_STATE_IDS"),
             },
             timeout_seconds=float(os.environ.get("PLANE_TIMEOUT_SECONDS", "30")),
             gitea_public_base_url=gitea_public_base_url or None,
@@ -94,10 +102,14 @@ class PlaneClient:
             if not IDENTIFIER_PATTERN.fullmatch(value):
                 raise PlaneClientError(f"Plane {label} is invalid")
         if recommendation not in {
+            "development_started",
+            "development_review",
+            "approved_for_testing",
             "move_to_testing",
             "return_to_development",
             "accepted",
             "rejected",
+            "cancelled",
             "manual_test_fix_required",
             "manual_implementation_fix_required",
         }:
@@ -108,10 +120,20 @@ class PlaneClient:
             f"/projects/{quote(project_id, safe='')}/work-items/{quote(issue_id, safe='')}"
         )
         state_id = self.state_ids.get(recommendation)
-        if recommendation in {"return_to_development", "accepted", "rejected"} and not state_id:
+        state_required = {
+            "development_started",
+            "development_review",
+            "approved_for_testing",
+            "return_to_development",
+            "accepted",
+            "rejected",
+            "cancelled",
+            "manual_implementation_fix_required",
+        }
+        if recommendation in state_required and not state_id:
             raise PlaneClientError(f"Plane state is not configured for {recommendation}")
         source_links_updated = 0
-        if recommendation == "move_to_testing":
+        if recommendation in {"development_review", "move_to_testing"}:
             change = details.get("implementation_change")
             if isinstance(change, dict):
                 source_links_updated = self._store_implementation_source(
@@ -169,6 +191,59 @@ class PlaneClient:
             raise PlaneClientError("Plane work item has an invalid implementation commit link")
         return {"implementation_ref": branch, "implementation_commit": commit}
 
+    def get_repository_source(
+        self,
+        *,
+        project_id: str,
+        issue_id: str,
+    ) -> dict[str, str] | None:
+        if self.gitea_public_base_url is None:
+            raise PlaneClientError("GITEA_PUBLIC_BASE_URL is required for repository links")
+        root = self._work_item_root(project_id, issue_id)
+        payload = self._request("GET", f"{root}/links/")
+        links = payload.get("results") if isinstance(payload, dict) else payload
+        if not isinstance(links, list):
+            raise PlaneClientError("Plane returned an invalid work item link list")
+        candidates: dict[str, tuple[str, str]] = {}
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            url = link.get("url")
+            if not isinstance(url, str):
+                continue
+            repository = self._repository_from_url(url)
+            if repository is not None:
+                candidates[repository.casefold()] = (repository, url)
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            raise PlaneClientError("Plane work item has multiple Gitea repository links")
+        repository, source_url = next(iter(candidates.values()))
+        return {"full_name": repository, "source_url": source_url}
+
+    def _repository_from_url(self, value: str) -> str | None:
+        base = urlsplit(self.gitea_public_base_url or "")
+        candidate = urlsplit(value.strip())
+        if (
+            candidate.scheme.casefold() != base.scheme.casefold()
+            or candidate.hostname != base.hostname
+            or candidate.port != base.port
+            or candidate.username is not None
+            or candidate.password is not None
+            or candidate.query
+            or candidate.fragment
+        ):
+            return None
+        base_parts = [part for part in base.path.split("/") if part]
+        candidate_parts = [unquote(part) for part in candidate.path.split("/") if part]
+        if candidate_parts[: len(base_parts)] != base_parts:
+            return None
+        repository_parts = candidate_parts[len(base_parts) :]
+        if len(repository_parts) != 2:
+            return None
+        repository = "/".join(repository_parts)
+        return repository if REPOSITORY_PATTERN.fullmatch(repository) else None
+
     def _store_implementation_source(
         self,
         root: str,
@@ -194,6 +269,10 @@ class PlaneClient:
             f"/commit/{commit.lower()}"
         )
         changed = 0
+        repository_url = (
+            f"{self.gitea_public_base_url}/{quote(owner, safe='')}/{quote(name, safe='')}"
+        )
+        changed += self._upsert_link(root, REPOSITORY_TITLE, repository, repository_url)
         changed += self._upsert_link(root, BRANCH_TITLE, branch, branch_url)
         changed += self._upsert_link(root, COMMIT_TITLE, commit.lower(), commit_url)
         return changed
@@ -204,16 +283,32 @@ class PlaneClient:
         if not isinstance(links, list):
             raise PlaneClientError("Plane returned an invalid work item link list")
         title = f"{prefix}{value}"
-        existing = next(
+        existing_by_url = next(
             (
                 link
                 for link in links
-                if isinstance(link, dict)
-                and isinstance(link.get("title"), str)
-                and link["title"].startswith(prefix)
+                if isinstance(link, dict) and link.get("url") == url
             ),
             None,
         )
+        if existing_by_url is not None:
+            # A repository URL is normally supplied by the user and its title is not
+            # part of the repository-source contract. Preserve that title and avoid
+            # a duplicate URL, which Plane rejects with HTTP 400.
+            if prefix == REPOSITORY_TITLE or existing_by_url.get("title") == title:
+                return 0
+            existing = existing_by_url
+        else:
+            existing = next(
+                (
+                    link
+                    for link in links
+                    if isinstance(link, dict)
+                    and isinstance(link.get("title"), str)
+                    and link["title"].startswith(prefix)
+                ),
+                None,
+            )
         if existing is None:
             self._request("POST", f"{root}/links/", {"title": title, "url": url})
             return 1
