@@ -4,9 +4,12 @@ from typing import Any
 
 from .gitea_client import GiteaClient, GiteaClientError
 from .models import ArtifactRef, CommandScenarioStep, StepResult, WorkflowInstance
+from .operation_catalog import operation_ids, validate_operation_parameters
 from .plane_client import PlaneClient, PlaneClientError
 from .test_runner import DockerTestRunner, TestRunnerError
 from .workflow_errors import WorkflowExecutionError
+
+ALLOWED_WORKFLOW_COMMANDS = operation_ids()
 
 
 class CommandExecutor:
@@ -31,17 +34,13 @@ class CommandExecutor:
         attempt: int,
         step: CommandScenarioStep,
     ) -> StepResult:
-        if step.command not in {
-            "complete",
-            "fail",
-            "store_failure_report",
-            "allow_test_rewrite",
-            "execute_test_change",
-            "classify_test_run",
-            "create_final_pull_request",
-            "sync_plane_issue",
-        }:
+        if step.command not in ALLOWED_WORKFLOW_COMMANDS:
             raise WorkflowExecutionError(f"command is not allowlisted: {step.command}")
+        parameter_errors = validate_operation_parameters(step.command, step.parameters)
+        if parameter_errors:
+            raise WorkflowExecutionError(
+                f"command parameters are invalid: {'; '.join(parameter_errors)}"
+            )
         artifacts: list[ArtifactRef] = []
         if step.command == "sync_plane_issue":
             if self.plane_client is None:
@@ -89,6 +88,100 @@ class CommandExecutor:
             outcome = "SUCCESS"
             data = {"plane_sync": plane_sync}
             default_summary = "Plane issue synchronized"
+        elif step.command == "verify_bug_report":
+            if self.gitea_client is None or self.test_runner is None:
+                raise WorkflowExecutionError("Gitea client and deterministic test runner are required")
+            author_step = step.parameters.get("author_step", "find-bugs")
+            report = next(
+                (
+                    result.data.get("bug_report")
+                    for result in reversed(workflow.executions)
+                    if result.step_id == author_step
+                    and result.execution_status == "COMPLETED"
+                    and result.outcome == "SUCCESS"
+                    and isinstance(result.data.get("bug_report"), dict)
+                ),
+                None,
+            )
+            if not isinstance(report, dict):
+                raise WorkflowExecutionError("validated bug report is required")
+            repository = report.get("repository")
+            commit = report.get("inspected_commit")
+            findings = report.get("findings")
+            if (
+                not isinstance(repository, str)
+                or not isinstance(commit, str)
+                or not isinstance(findings, list)
+            ):
+                raise WorkflowExecutionError("bug report has no valid repository revision")
+            try:
+                archive = self.gitea_client.download_archive(
+                    repository=repository,
+                    commit=commit,
+                )
+                verifications: list[dict[str, Any]] = []
+                for finding in findings:
+                    reproducer = finding.get("reproducer") if isinstance(finding, dict) else None
+                    if not isinstance(reproducer, dict):
+                        raise WorkflowExecutionError("bug finding has no reproducer")
+                    path = reproducer.get("path")
+                    command = reproducer.get("command")
+                    content = reproducer.get("content")
+                    if (
+                        not isinstance(path, str)
+                        or not isinstance(command, list)
+                        or not isinstance(content, str)
+                    ):
+                        raise WorkflowExecutionError("bug reproducer fields are invalid")
+                    run = self.test_runner.run(
+                        archive,
+                        command,
+                        overlay_files={path: content.encode("utf-8")},
+                    )
+                    verifications.append(
+                        {
+                            "finding_id": finding.get("id"),
+                            "verdict": run.verdict,
+                            "command": run.command,
+                            "exit_code": run.exit_code,
+                            "framework": run.framework,
+                            "total": run.total,
+                            "passed": run.passed,
+                            "failed": run.failed,
+                            "errors": run.errors,
+                            "summary": run.summary,
+                            "output": run.output,
+                            "authoritative": True,
+                        }
+                    )
+            except (GiteaClientError, TestRunnerError) as exc:
+                raise WorkflowExecutionError(str(exc)) from exc
+            verified = bool(verifications) and all(
+                item["verdict"] == "PRODUCT_FAILURE"
+                and item["framework"] in {"pytest", "jest", "go", "dotnet"}
+                for item in verifications
+            )
+            no_findings = report.get("status") == "NO_FINDINGS" and not findings
+            outcome = "SUCCESS" if verified or no_findings else "FAILURE"
+            verification_status = (
+                "NO_FINDINGS" if no_findings else "VERIFIED" if verified else "UNVERIFIED"
+            )
+            data = {
+                "bug_verification": {
+                    "status": verification_status,
+                    "repository": repository,
+                    "commit": commit,
+                    "findings": verifications,
+                    "authoritative": True,
+                }
+            }
+            default_summary = (
+                "All reported defects were reproduced independently"
+                if verified
+                else "Bug analysis completed without findings"
+                if no_findings
+                else "One or more reported defects could not be reproduced independently"
+            )
         elif step.command == "execute_test_change":
             if self.gitea_client is None or self.test_runner is None:
                 raise WorkflowExecutionError("Gitea client and deterministic test runner are required")
@@ -219,7 +312,7 @@ class CommandExecutor:
                 if failed
                 else "No failed step result is available"
             )
-        elif step.command == "allow_test_rewrite":
+        elif step.command in {"allow_test_rewrite", "allow_bug_rewrite"}:
             author_step = step.parameters.get("author_step")
             max_iterations = step.parameters.get("max_iterations")
             if not isinstance(author_step, str) or not author_step:
@@ -241,9 +334,9 @@ class CommandExecutor:
                 "max_iterations": max_iterations,
             }
             default_summary = (
-                "Test author may repair invalid test code"
+                "Agent may repair the unverified result"
                 if outcome == "SUCCESS"
-                else "Test rewrite limit reached"
+                else "Result rewrite limit reached"
             )
         elif step.command == "classify_test_run":
             executor_step = step.parameters.get("executor_step")

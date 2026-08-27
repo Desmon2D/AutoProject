@@ -10,7 +10,7 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 TOKEN_PATTERN = re.compile(r"[\w-]+", re.UNICODE)
 
@@ -62,9 +62,26 @@ def search_documents(
         if tokens and matches == 0:
             continue
         score = matches / max(len(tokens), 1)
-        ranked.append((score, document))
+        document_id = str(document.get("document_id", "")).strip()
+        if not document_id:
+            document_id = hashlib.sha256(document["url"].encode("utf-8")).hexdigest()[:16]
+        ranked.append((score, {**document, "document_id": document_id}))
     ranked.sort(key=lambda item: (-item[0], item[1]["title"].casefold()))
     return [{**document, "swirl_score": round(score, 4)} for score, document in ranked[:limit]]
+
+
+def find_document(documents: list[dict[str, Any]], upstream_url: str) -> dict[str, Any] | None:
+    path = urlparse(upstream_url).path.rstrip("/")
+    document_id = unquote(path.rsplit("/", 1)[-1]) if path else ""
+    if not document_id:
+        return None
+    for document in documents:
+        candidate = str(document.get("document_id", "")).strip()
+        if not candidate:
+            candidate = hashlib.sha256(document["url"].encode("utf-8")).hexdigest()[:16]
+        if hmac.compare_digest(candidate, document_id):
+            return document
+    return None
 
 
 def build_response(
@@ -102,7 +119,8 @@ class SwirlLiteHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._json(200, {"status": "ok", "documents": len(self.server.documents)})
             return
-        if parsed.path.rstrip("/") != "/api/swirl/search":
+        route = parsed.path.rstrip("/")
+        if route not in {"/api/swirl/search", "/api/swirl/fetch-document"}:
             self._json(404, {"detail": "not found"})
             return
         if not self._authorized():
@@ -111,6 +129,14 @@ class SwirlLiteHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         parameters = parse_qs(parsed.query)
+        if route == "/api/swirl/fetch-document":
+            upstream_url = parameters.get("url", [""])[0].strip()
+            document = find_document(self.server.documents, upstream_url)
+            if document is None:
+                self._json(404, {"detail": "document not found"})
+                return
+            self._json(200, {"markdown": document["body"]})
+            return
         query = parameters.get("qs", [""])[0].strip()
         if not query or len(query) > 2000:
             self._json(400, {"detail": "qs must contain 1..2000 characters"})

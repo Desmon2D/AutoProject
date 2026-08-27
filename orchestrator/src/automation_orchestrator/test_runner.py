@@ -64,7 +64,13 @@ class DockerTestRunner:
         self.max_archive_bytes = max_archive_bytes
         self.max_output_bytes = max_output_bytes
 
-    def run(self, archive: bytes, command: list[str]) -> TestRun:
+    def run(
+        self,
+        archive: bytes,
+        command: list[str],
+        *,
+        overlay_files: dict[str, bytes] | None = None,
+    ) -> TestRun:
         if not command or len(command) > 32 or any(
             not isinstance(item, str) or not item or len(item) > 1000 for item in command
         ):
@@ -97,6 +103,10 @@ class DockerTestRunner:
             seeder.start()
             if not seeder.put_archive("/workspace", normalized):
                 raise TestRunnerError("cannot copy repository archive into test workspace")
+            if overlay_files:
+                overlay = self._build_overlay_archive(overlay_files)
+                if not seeder.put_archive("/workspace", overlay):
+                    raise TestRunnerError("cannot copy test overlay into test workspace")
             seeder.remove(force=True)
             seeder = None
             container = client.containers.create(
@@ -169,6 +179,35 @@ class DockerTestRunner:
                     volume.remove(force=True)
                 except DockerException:
                     pass
+
+    @staticmethod
+    def _build_overlay_archive(files: dict[str, bytes]) -> bytes:
+        if not files or len(files) > 50:
+            raise TestRunnerError("test overlay must contain between 1 and 50 files")
+        output = io.BytesIO()
+        total_size = 0
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            for relative_path, content in sorted(files.items()):
+                path = PurePosixPath(relative_path)
+                if (
+                    path.is_absolute()
+                    or ".." in path.parts
+                    or path.as_posix() != relative_path
+                    or not isinstance(content, bytes)
+                ):
+                    raise TestRunnerError("test overlay contains an invalid path or payload")
+                total_size += len(content)
+                if total_size > 1024 * 1024:
+                    raise TestRunnerError("test overlay exceeds 1 MiB")
+                member = tarfile.TarInfo(relative_path)
+                member.size = len(content)
+                member.uid = 10001
+                member.gid = 10001
+                member.uname = "sandbox"
+                member.gname = "sandbox"
+                member.mode = 0o600
+                archive.addfile(member, io.BytesIO(content))
+        return output.getvalue()
 
     def _normalize_archive(self, archive: bytes) -> bytes:
         if not archive or len(archive) > self.max_archive_bytes:

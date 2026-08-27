@@ -98,13 +98,17 @@ Main endpoints:
 - `POST /v1/webhooks/plane` — signed Plane issue ingestion;
 - `GET /v1/workflows` — workflow history ordered by last update;
 - `POST /v1/webhooks/gitea` — signed Gitea event ingestion;
+- `POST /v1/events` — fan-out an idempotent event to matching published user flows;
 - `GET /v1/plugins` — plugin catalog and availability;
 - `GET /v1/skills` — filesystem skill catalog and runtime requirements;
 - `GET /v1/capabilities` — available runtime capabilities;
 - `GET /v1/images` — prepared sandbox image profiles;
 - `GET /v1/scenarios` — validated workflow graph catalog;
+- `POST /v1/flows` — create an empty flow draft or clone an existing flow with `source_flow_id`;
 - `POST /v1/analysis` — enqueue a documentation analysis request that must produce a validated
   Markdown artifact;
+- `POST /v1/bug-finding` — inspect an exact repository revision and independently verify every
+  reported minimal reproducer without changing product code;
 - `POST /v1/triggers` — idempotently create and enqueue a workflow (`202 Accepted`);
 - `GET /v1/workflows/{workflow_id}` — persisted workflow state and execution history;
 - `POST /v1/workflows/{workflow_id}/review` — resolve and re-enqueue a waiting review;
@@ -170,9 +174,9 @@ On a new machine, restore or create equivalent rootless Gitea volumes first.
 `start-dev-gitea.ps1` also creates or updates the repository webhook for pull-request
 and review lifecycle events. Its secret is generated once, stored in the ignored `.env`,
 and passed to the orchestrator. Deliveries are verified against `X-Gitea-Signature`
-before JSON is parsed. Ordinary push events are intentionally ignored and never create
-a workflow or model call; development and testing branches are tracked by their parent
-workflows.
+before JSON is parsed. Push events remain ignored by legacy scenarios, but can start a published
+user flow with trigger `gitea.push`. Branches under `refs/heads/automation/` are always suppressed
+to prevent feedback loops; development and testing branches are tracked by their parent workflows.
 
 The queue is a SQLite database in the shared persistent `/data` volume. A worker
 claims one workflow with a renewable lease. After a worker crash the lease expires
@@ -234,6 +238,12 @@ retry is allowed only from `FAILED` and creates a fresh overall deadline.
 
 The orchestrator is trusted infrastructure and needs access to the Docker socket.
 Agent containers do not receive that socket.
+
+The Context Builder separates execution instructions, trigger requirements, repository identity,
+review feedback, prior step history, and retrieved documentation. Execution instructions are
+packed first, each section has its own bound, and every persisted agent result includes a
+`context_usage` manifest with included, truncated, and omitted source counts but never the raw
+prompt.
 
 The deterministic test runner adds machine-readable reporting for direct Pytest (JUnit), Jest
 (JSON), Go (`-json`), and .NET (TRX) invocations. Recognized textual reports from Python unittest,

@@ -6,7 +6,10 @@ from pathlib import Path
 from .audit_store import AuditStore
 from .capability_registry import CapabilityRegistry
 from .context_builder import ContextBuilder
+from .flow_store import FlowStore
 from .gitea_client import GiteaClient
+from .graph_run_store import GraphRunStore
+from .graph_runtime import GraphRuntime
 from .image_builder import DockerImageBuilder
 from .image_registry import ImageRegistry
 from .image_resolver import AgentImageResolver
@@ -89,4 +92,12 @@ def build_service() -> AgentService:
         audit_store=service.audit_store,
     )
     service.workflow_queue = WorkflowQueue(queue_path)
+    service.flow_store = FlowStore(jobs_root / "flows.sqlite3")
+    service.graph_run_store = GraphRunStore(jobs_root / "graph-runs.sqlite3")
+    service.graph_runtime = GraphRuntime(
+        service.flow_store,
+        service.graph_run_store,
+        service.workflow_engine,
+        service.workflow_queue,
+    )
     return service

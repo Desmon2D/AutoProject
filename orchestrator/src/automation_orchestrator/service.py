@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import PurePosixPath
 from typing import Any
 
 from .context_builder import ContextBuilder
@@ -76,6 +77,22 @@ class AgentService:
             ),
         )
         result = self._normalize(request, sandbox_result)
+        result = result.model_copy(
+            update={
+                "data": {
+                    **result.data,
+                    "context_usage": {
+                        "digest": prepared.context.digest,
+                        "character_count": prepared.context.character_count,
+                        "truncated": prepared.context.truncated,
+                        "sources": [
+                            source.model_dump(mode="json")
+                            for source in prepared.context.source_report
+                        ],
+                    },
+                }
+            }
+        )
         self.job_store.save(result)
         return result
 
@@ -97,6 +114,27 @@ class AgentService:
         for artifact in result.artifacts:
             path = artifact.get("path")
             uri = artifact.get("uri") or artifact.get("ref")
+            if not path and isinstance(uri, str) and uri.startswith("/output/"):
+                relative = uri.removeprefix("/output/")
+                candidate = PurePosixPath(relative)
+                if (
+                    relative
+                    and not candidate.is_absolute()
+                    and ".." not in candidate.parts
+                    and candidate.as_posix() == relative
+                ):
+                    path = relative
+            if not path and isinstance(uri, str) and uri.startswith("artifact://"):
+                relative = uri.removeprefix("artifact://")
+                candidate = PurePosixPath(relative)
+                if (
+                    relative
+                    and "/" not in relative
+                    and not candidate.is_absolute()
+                    and ".." not in candidate.parts
+                    and candidate.as_posix() == relative
+                ):
+                    path = relative
             if path:
                 uri = f"artifact://{request.execution_id}/{str(path).lstrip('/')}"
             if not uri:
@@ -112,6 +150,19 @@ class AgentService:
             )
 
         data: dict[str, Any] = dict(result.data)
+        bug_report_keys = {
+            "repository",
+            "requested_ref",
+            "inspected_commit",
+            "status",
+            "report_path",
+            "findings",
+        }
+        if (
+            "bug_report" not in data
+            and bug_report_keys.issubset(data)
+        ):
+            data["bug_report"] = {key: data.pop(key) for key in bug_report_keys}
         data.update(
             {
                 "summary": result.summary,

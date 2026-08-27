@@ -45,8 +45,77 @@ def test_context_builder_selects_relevant_data_and_redacts_secrets():
     assert result.digest
 
 
+def test_context_builder_includes_resolved_node_inputs():
+    result = ContextBuilder().build(
+        AgentStep(id="implement", prompt="Implement", model="test"),
+        WorkflowContext(node_inputs={"ticket": {"id": "A-1"}}),
+    )
+
+    assert "node_inputs" in result.included_sources
+    assert '"id": "A-1"' in result.prompt
+
+
 def test_context_builder_honors_size_limit():
     step = AgentStep(id="small", prompt="x" * 1000, model="test")
     result = ContextBuilder(max_characters=200).build(step, WorkflowContext())
     assert result.character_count <= 200
+    assert result.truncated is True
+
+
+def test_context_builder_separates_sources_and_reports_usage():
+    step = AgentStep(id="investigate", prompt="Find the defect", model="test")
+    context = WorkflowContext(
+        trigger_data={
+            "scope": "payment retries",
+            "symptoms": "duplicate charge",
+            "repository": {"full_name": "team/service", "ref": "main"},
+        },
+        scenario={"workflow_id": "wf-1", "current_step": "find-bugs"},
+        previous_steps=[
+            PreviousStepResult(
+                step_id="verify",
+                execution_status="COMPLETED",
+                outcome="FAILURE",
+                data={"summary": "Reproducer was invalid"},
+            )
+        ],
+        review_comments=["Focus on timeout handling"],
+        retrieval_summary={"topic_coverage_sufficient": True},
+        swirl_results=[
+            {
+                "title": "Retry policy",
+                "url": "https://kb.example/retry",
+                "excerpts": [{"text": "A payment is retried once."}],
+            }
+        ],
+    )
+
+    result = ContextBuilder().build(step, context)
+
+    assert result.prompt.index("# Execution contract") < result.prompt.index("# Task")
+    assert "# Trigger requirements and inputs" in result.prompt
+    assert "# Repository context from Trigger data" in result.prompt
+    assert result.prompt.count('"full_name": "team/service"') == 1
+    reports = {item.source: item for item in result.source_report}
+    assert reports["requirements"].category == "requirements"
+    assert reports["repository"].category == "repository"
+    assert reports["review_comments"].category == "review"
+    assert reports["previous_steps"].category == "history"
+    assert reports["swirl_results"].category == "documentation"
+    assert all(not item.omitted for item in result.source_report)
+
+
+def test_context_builder_reports_omitted_low_priority_sources():
+    result = ContextBuilder(max_characters=500).build(
+        AgentStep(id="small", prompt="Inspect carefully", model="test"),
+        WorkflowContext(
+            trigger_data={"scope": "x" * 2000},
+            swirl_results=[{"title": "doc", "url": "https://kb", "snippet": "y" * 2000}],
+        ),
+    )
+
+    reports = {item.source: item for item in result.source_report}
+    assert reports["execution_contract"].omitted is False
+    assert reports["swirl_results"].omitted is True
+    assert reports["swirl_results"].included_characters == 0
     assert result.truncated is True

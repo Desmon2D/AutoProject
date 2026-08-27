@@ -288,6 +288,227 @@ def test_testing_scenario_uses_agent_author_and_deterministic_executor():
     assert scenario.steps["await-user-decision"].decision == "merge"
 
 
+def test_bug_finding_scenario_separates_investigation_from_verification():
+    registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    scenario = registry.get("bug-finding")
+
+    assert scenario.stage == "bug-finding"
+    assert scenario.version == "3"
+    assert scenario.trigger.event == "bug-finding.requested"
+    finder = scenario.steps["find-bugs"]
+    verifier = scenario.steps["verify-reproducers"]
+
+    assert isinstance(finder, AgentScenarioStep)
+    assert isinstance(verifier, CommandScenarioStep)
+    assert finder.result_contract == "bug_report"
+    assert finder.plugins == ["git", "gitea", "swirl", "python"]
+    assert "never modify or push product code" in finder.prompt
+    assert verifier.command == "verify_bug_report"
+    assert verifier.transitions["FAILURE"] == "allow-report-rewrite"
+
+
+def test_bug_report_contract_requires_structured_reproducer_and_report(
+    tmp_path: Path, image_resolver
+):
+    registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    service = AgentService(
+        ContextBuilder(), image_resolver, SandboxManager(tmp_path / "jobs")
+    )
+    engine = WorkflowEngine(
+        registry,
+        WorkflowStore(tmp_path / "workflows"),
+        service,
+    )
+    workflow, _ = engine.create(
+        TriggerEvent(
+            source="manual",
+            event="bug-finding.requested",
+            event_id="bug-contract-1",
+            data={
+                "repository": {"full_name": "team/service", "ref": "main"},
+                "scope": "payment retry",
+                "search_query": "payment retry",
+            },
+        )
+    )
+    step = registry.get("bug-finding").steps["find-bugs"]
+    execution_id = "bug-contract-execution"
+    output = tmp_path / "jobs" / execution_id / "output"
+    output.mkdir(parents=True)
+    output.joinpath("bug-report.md").write_text(
+        "# Bug report\n\n## BUG-001: retry counter\n\n"
+        "A deterministic reproducer demonstrates that the retry counter is incremented twice. "
+        "The inspected implementation violates the expected single increment and the report "
+        "records the exact source evidence and command.\n",
+        encoding="utf-8",
+    )
+    result = StepResult(
+        step_id="find-bugs",
+        execution_id=execution_id,
+        iteration=1,
+        attempt=1,
+        execution_status="COMPLETED",
+        outcome="SUCCESS",
+        data={
+            "bug_report": {
+                "repository": "team/service",
+                "requested_ref": "main",
+                "inspected_commit": "a" * 40,
+                "status": "FOUND",
+                "report_path": "bug-report.md",
+                "findings": [
+                    {
+                        "id": "BUG-001",
+                        "title": "Retry counter increments twice",
+                        "severity": "medium",
+                        "confidence": "high",
+                        "evidence": [
+                            {
+                                "path": "src/retry.py",
+                                "line": 17,
+                                "description": "Both branches increment the same counter",
+                            }
+                        ],
+                        "reproduction": {
+                            "steps": ["Run the focused Pytest reproducer"],
+                            "expected": "Counter equals one",
+                            "actual": "Counter equals two",
+                        },
+                        "root_cause": "The success branch duplicates the common increment",
+                        "reproducer": {
+                            "path": "reproducers/test_bug_001.py",
+                            "command": ["python3", "-m", "pytest", "reproducers/test_bug_001.py"],
+                            "content": "def test_retry_counter():\n    assert 2 == 1\n",
+                        },
+                    }
+                ],
+            }
+        },
+        artifacts=[ArtifactRef(type="file", uri="artifact://bug-report.md")],
+    )
+
+    validated = engine._validate_agent_result(
+        workflow, "find-bugs", 1, 1, step, result
+    )
+
+    assert validated.execution_status == "COMPLETED"
+    assert validated.artifacts[0].type == "report"
+    assert validated.artifacts[0].uri == (
+        f"artifact://{execution_id}/bug-report.md"
+    )
+
+    invalid = result.model_copy(
+        update={
+            "data": {
+                "bug_report": {
+                    **result.data["bug_report"],
+                    "findings": [
+                        {
+                            **result.data["bug_report"]["findings"][0],
+                            "reproducer": {"path": "../unsafe.py", "command": ["pytest"], "content": "x"},
+                        }
+                    ],
+                }
+            }
+        }
+    )
+    rejected = engine._validate_agent_result(
+        workflow, "find-bugs", 1, 1, step, invalid
+    )
+
+    assert rejected.execution_status == "ERROR"
+    assert rejected.error.code == "AGENT_BUG_FINDING_INVALID"
+
+
+def test_bug_report_verifier_uses_clean_revision_and_overlay():
+    report = {
+        "repository": "team/service",
+        "requested_ref": "main",
+        "inspected_commit": "b" * 40,
+        "status": "FOUND",
+        "report_path": "bug-report.md",
+        "findings": [
+            {
+                "id": "BUG-001",
+                "reproducer": {
+                    "path": "reproducers/test_bug_001.py",
+                    "command": ["pytest", "reproducers/test_bug_001.py"],
+                    "content": "def test_bug():\n    assert False\n",
+                },
+            }
+        ],
+    }
+    workflow = WorkflowInstance(
+        id="wf-bug-verification",
+        scenario_id="bug-finding",
+        scenario_version="1",
+        trigger=TriggerEvent(
+            source="manual",
+            event="bug-finding.requested",
+            event_id="bug-verification-1",
+        ),
+        status="RUNNING",
+        current_step="verify-reproducers",
+        executions=[
+            StepResult(
+                step_id="find-bugs",
+                execution_id="finder-1",
+                iteration=1,
+                attempt=1,
+                execution_status="COMPLETED",
+                outcome="SUCCESS",
+                data={"bug_report": report},
+            )
+        ],
+    )
+    calls = []
+
+    class StubGitea:
+        def download_archive(self, **kwargs):
+            assert kwargs == {"repository": "team/service", "commit": "b" * 40}
+            return b"clean-archive"
+
+    class StubRunner:
+        def run(self, archive, command, *, overlay_files=None):
+            calls.append((archive, command, overlay_files))
+            return TestRun(
+                command=command,
+                exit_code=1,
+                passed=0,
+                failed=1,
+                verdict="PRODUCT_FAILURE",
+                summary="1 failed",
+                output="assertion failed",
+                framework="pytest",
+                total=1,
+            )
+
+    step = CommandScenarioStep(
+        type="command",
+        command="verify_bug_report",
+        parameters={"author_step": "find-bugs"},
+        transitions={"SUCCESS": None, "FAILURE": None},
+    )
+    result = CommandExecutor(StubGitea(), test_runner=StubRunner()).execute(
+        workflow=workflow,
+        step_id="verify-reproducers",
+        iteration=1,
+        attempt=1,
+        step=step,
+    )
+
+    assert result.outcome == "SUCCESS"
+    assert result.data["bug_verification"]["status"] == "VERIFIED"
+    assert result.data["bug_verification"]["authoritative"] is True
+    assert calls == [
+        (
+            b"clean-archive",
+            ["pytest", "reproducers/test_bug_001.py"],
+            {"reproducers/test_bug_001.py": b"def test_bug():\n    assert False\n"},
+        )
+    ]
+
+
 def test_testing_event_inherits_exact_change_from_same_plane_issue(tmp_path: Path, image_resolver):
     engine = build_engine(tmp_path, image_resolver, review_scenario())
     implementation = WorkflowInstance(
@@ -491,7 +712,12 @@ def test_testing_scenario_passes_after_authored_tests_succeed(
         SandboxManager(tmp_path / "jobs"),
     )
 
+    ensured_branches = []
+
     class StubGitea:
+        def ensure_branch(self, **kwargs):
+            ensured_branches.append(kwargs)
+
         def verify_branch(self, **_kwargs):
             return None
 
@@ -546,9 +772,9 @@ def test_testing_scenario_passes_after_authored_tests_succeed(
                         "base_ref": "feature/payment-retry",
                         "base_commit": "b" * 40,
                         "branch": f"automation/{request.workflow_id}",
-                        "commit": "a" * 40,
+                        "commit": "b" * 40,
                         "command": ["python3", "-m", "pytest"],
-                        "changed": True,
+                        "changed": False,
                     }
                 },
             )
@@ -574,6 +800,13 @@ def test_testing_scenario_passes_after_authored_tests_succeed(
     assert waiting.pending_review is not None
     assert waiting.pending_review.decision == "merge"
     assert waiting.pending_review.pull_index == 9
+    assert ensured_branches == [
+        {
+            "repository": "team/service",
+            "branch": f"automation/{waiting.id}",
+            "commit": "b" * 40,
+        }
+    ]
     assert [execution.step_id for execution in waiting.executions] == [
         "write-tests",
         "execute-tests",
@@ -1393,6 +1626,28 @@ def test_workflow_context_searches_only_bookstack_and_keeps_normalized_results(
             "score": None,
         }
     ]
+
+
+def test_agent_context_keeps_resolved_node_inputs(tmp_path: Path, image_resolver):
+    engine = build_engine(tmp_path, image_resolver, review_scenario())
+    workflow, _ = engine.create(
+        TriggerEvent(
+            source="manual",
+            event="review",
+            event_id="agent-node-inputs-1",
+            data={},
+        )
+    )
+    step = AgentScenarioStep(
+        type="agent",
+        prompt="Implement the ticket",
+        model="test",
+        transitions={"SUCCESS": None, "FAILURE": None},
+    )
+
+    context = engine._context(workflow, step, node_inputs={"ticket": {"id": "A-1"}})
+
+    assert context.node_inputs == {"ticket": {"id": "A-1"}}
 
 
 def test_workflow_context_fetches_full_source_text(tmp_path: Path, image_resolver):

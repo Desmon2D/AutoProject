@@ -23,6 +23,7 @@ IMAGE_MANIFEST_PATH = Path("/opt/sandbox/image-manifest.json")
 GIT_AUTH_DIR = WORKSPACE_DIR / ".automation-git-auth"
 GIT_CREDENTIAL_SOCKET = GIT_AUTH_DIR / "git-credential.sock"
 GIT_CREDENTIAL_CONFIG = GIT_AUTH_DIR / "gitconfig"
+GIT_ASKPASS_PATH = GIT_AUTH_DIR / "git-askpass.py"
 MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._:/-]{1,200}$")
 PLUGIN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -162,11 +163,13 @@ class GitCredentialServer:
         path: Path,
         *,
         config_path: Path | None = None,
+        askpass_path: Path | None = None,
     ):
         self.username = username
         self.token = token
         self.path = path
         self.config_path = config_path
+        self.askpass_path = askpass_path
         self._stop = threading.Event()
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.path.unlink(missing_ok=True)
@@ -183,25 +186,32 @@ class GitCredentialServer:
                 connection, _ = self._socket.accept()
             except (TimeoutError, OSError):
                 continue
-            with connection:
-                prompt = connection.recv(4096).decode("utf-8", errors="replace")
-                if "Username" in prompt:
-                    response = self.username
-                elif "Password" in prompt:
-                    response = self.token
-                else:
-                    response = ""
-                connection.sendall(response.encode("utf-8"))
+            try:
+                with connection:
+                    prompt = connection.recv(4096).decode("utf-8", errors="replace")
+                    if "Username" in prompt:
+                        response = self.username
+                    elif "Password" in prompt:
+                        response = self.token
+                    else:
+                        response = ""
+                    connection.sendall(response.encode("utf-8"))
+            except OSError:
+                # A cancelled Git command may close its connection before the
+                # response is sent. Keep serving credentials for later calls.
+                continue
 
     def close(self) -> None:
         self._stop.set()
         self._socket.close()
         self._thread.join(timeout=1)
         self.path.unlink(missing_ok=True)
-        if self.config_path is not None:
-            self.config_path.unlink(missing_ok=True)
+        for artifact_path in (self.config_path, self.askpass_path):
+            if artifact_path is not None:
+                artifact_path.unlink(missing_ok=True)
+        if self.config_path is not None or self.askpass_path is not None:
             try:
-                self.config_path.parent.rmdir()
+                self.path.parent.rmdir()
             except OSError:
                 pass
 
@@ -214,6 +224,18 @@ def configure_git_auth() -> GitCredentialServer | None:
     if not username:
         raise ValueError("GITEA_USERNAME is required when GITEA_TOKEN is configured")
     GIT_AUTH_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    askpass_code = (
+        "#!/usr/bin/python3\n"
+        "import os,socket,sys\n"
+        "client=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+        "client.connect(os.environ['AUTOMATION_GIT_AUTH_SOCKET'])\n"
+        "client.sendall(' '.join(sys.argv[1:]).encode())\n"
+        "client.shutdown(socket.SHUT_WR)\n"
+        "print(client.recv(4096).decode())\n"
+        "client.close()\n"
+    )
+    GIT_ASKPASS_PATH.write_text(askpass_code, encoding="utf-8")
+    GIT_ASKPASS_PATH.chmod(0o500)
     helper_code = (
         "import os,socket\n"
         "path=os.environ['AUTOMATION_GIT_AUTH_SOCKET']\n"
@@ -241,6 +263,8 @@ def configure_git_auth() -> GitCredentialServer | None:
     # GIT_CONFIG_KEY_* is scrubbed by the model shell because its name looks
     # credential-like. A dedicated config file avoids that ambient variable.
     os.environ["GIT_CONFIG_GLOBAL"] = str(GIT_CREDENTIAL_CONFIG)
+    os.environ["GIT_ASKPASS"] = str(GIT_ASKPASS_PATH)
+    os.environ["SSH_ASKPASS"] = str(GIT_ASKPASS_PATH)
     os.environ["GIT_TERMINAL_PROMPT"] = "0"
     os.environ["AUTOMATION_GIT_AUTH_SOCKET"] = str(GIT_CREDENTIAL_SOCKET)
     return GitCredentialServer(
@@ -248,6 +272,7 @@ def configure_git_auth() -> GitCredentialServer | None:
         token,
         GIT_CREDENTIAL_SOCKET,
         config_path=GIT_CREDENTIAL_CONFIG,
+        askpass_path=GIT_ASKPASS_PATH,
     )
 
 

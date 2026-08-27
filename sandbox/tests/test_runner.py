@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, run
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -22,10 +23,12 @@ class LoadAgentResultTests(unittest.TestCase):
             auth_dir = Path(directory) / ".automation-git-auth"
             auth_socket = auth_dir / "git-auth.sock"
             credential_config = auth_dir / "gitconfig"
+            askpass_path = auth_dir / "git-askpass.py"
             with (
                 patch.object(runner, "GIT_AUTH_DIR", auth_dir),
                 patch.object(runner, "GIT_CREDENTIAL_SOCKET", auth_socket),
                 patch.object(runner, "GIT_CREDENTIAL_CONFIG", credential_config),
+                patch.object(runner, "GIT_ASKPASS_PATH", askpass_path),
                 patch.dict(
                     "os.environ",
                     {"GITEA_USERNAME": "harnes", "GITEA_TOKEN": "secret-token"},
@@ -35,19 +38,32 @@ class LoadAgentResultTests(unittest.TestCase):
                 server = configure_git_auth()
                 self.assertIsNotNone(server)
                 try:
-                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                        client.connect(str(auth_socket))
-                        client.sendall(b"Password for repository")
-                        client.shutdown(socket.SHUT_WR)
-                        self.assertEqual(client.recv(4096), b"secret-token")
+                    completed = run(
+                        [sys.executable, str(askpass_path), "Password for repository"],
+                        capture_output=True,
+                        check=False,
+                        env={
+                            **os.environ,
+                            "AUTOMATION_GIT_AUTH_SOCKET": str(auth_socket),
+                        },
+                        text=True,
+                    )
+                    self.assertEqual(completed.returncode, 0)
+                    self.assertEqual(completed.stdout.strip(), "secret-token")
+                    self.assertNotIn("secret-token", askpass_path.read_text(encoding="utf-8"))
+                    self.assertNotIn(
+                        "secret-token", credential_config.read_text(encoding="utf-8")
+                    )
                 finally:
                     server.close()
 
                 self.assertEqual(
                     runner.os.environ["GIT_CONFIG_GLOBAL"], str(credential_config)
                 )
+                self.assertEqual(runner.os.environ["GIT_ASKPASS"], str(askpass_path))
                 self.assertEqual(runner.os.environ["GIT_TERMINAL_PROMPT"], "0")
                 self.assertFalse(credential_config.exists())
+                self.assertFalse(askpass_path.exists())
 
     def test_configures_native_openrouter_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

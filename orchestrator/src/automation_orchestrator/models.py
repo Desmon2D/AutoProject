@@ -61,6 +61,7 @@ class PreviousStepResult(StrictModel):
 
 class WorkflowContext(StrictModel):
     trigger_data: dict[str, Any] = Field(default_factory=dict)
+    node_inputs: dict[str, Any] = Field(default_factory=dict)
     scenario: dict[str, Any] = Field(default_factory=dict)
     previous_steps: list[PreviousStepResult] = Field(default_factory=list, max_length=100)
     review_comments: list[str] = Field(default_factory=list, max_length=100)
@@ -167,9 +168,27 @@ class AgentRunRequest(StrictModel):
 class BuiltContext(StrictModel):
     prompt: str
     included_sources: list[str]
+    source_report: list[ContextSourceReport] = Field(default_factory=list)
     character_count: int
     truncated: bool
     digest: str
+
+
+class ContextSourceReport(StrictModel):
+    source: str = Field(min_length=1, max_length=100)
+    category: Literal[
+        "instructions",
+        "requirements",
+        "repository",
+        "review",
+        "history",
+        "documentation",
+    ]
+    available_characters: int = Field(ge=0)
+    included_characters: int = Field(ge=0)
+    item_count: int = Field(default=1, ge=0)
+    truncated: bool = False
+    omitted: bool = False
 
 
 class PluginManifest(StrictModel):
@@ -342,7 +361,9 @@ class StepError(StrictModel):
 
 
 class StepStatusChange(StrictModel):
-    status: Literal["PENDING", "READY", "RUNNING", "WAITING", "COMPLETED", "ERROR", "CANCELLED"]
+    status: Literal[
+        "PENDING", "READY", "RUNNING", "WAITING", "COMPLETED", "ERROR", "CANCELLED", "SKIPPED"
+    ]
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -352,9 +373,17 @@ class StepResult(StrictModel):
     iteration: int
     attempt: int
     execution_status: Literal[
-        "PENDING", "READY", "RUNNING", "WAITING", "COMPLETED", "ERROR", "CANCELLED"
+        "PENDING",
+        "READY",
+        "RUNNING",
+        "WAITING",
+        "COMPLETED",
+        "ERROR",
+        "CANCELLED",
+        "SKIPPED",
     ]
     outcome: Literal["SUCCESS", "FAILURE"] | None
+    inputs: dict[str, Any] = Field(default_factory=dict)
     data: dict[str, Any] = Field(default_factory=dict)
     artifacts: list[ArtifactRef] = Field(default_factory=list)
     error: StepError | None = None
@@ -402,6 +431,7 @@ class ScenarioTrigger(StrictModel):
 class ScenarioStepBase(StrictModel):
     transitions: dict[str, str | None]
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
+    input_mapping: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("transitions")
     @classmethod
@@ -420,6 +450,7 @@ class AgentScenarioStep(ScenarioStepBase):
     plugins: list[str] = Field(default_factory=list, max_length=32)
     provider: Literal["openai", "openrouter"] = "openai"
     model: str = Field(min_length=1, max_length=200)
+    credential_id: str | None = Field(default=None, pattern=PLUGIN_PATTERN)
     timeout_seconds: int = Field(default=600, ge=1, le=3600)
     context_search: SwirlContextSearch | None = None
     result_contract: Literal[
@@ -429,6 +460,7 @@ class AgentScenarioStep(ScenarioStepBase):
         "test_change",
         "test_execution",
         "markdown_document",
+        "bug_report",
     ] = "none"
 
     @field_validator("plugins")
@@ -451,10 +483,38 @@ class ReviewScenarioStep(ScenarioStepBase):
     type: Literal["review"]
     provider: Literal["gitea", "plane"] = "gitea"
     decision: Literal["review", "merge"] = "review"
+    credential_id: str | None = Field(default=None, pattern=PLUGIN_PATTERN)
+
+
+class IfScenarioStep(ScenarioStepBase):
+    type: Literal["if"]
+    condition: str = Field(min_length=1, max_length=4000)
+
+
+class SwitchScenarioStep(ScenarioStepBase):
+    type: Literal["switch"]
+    value: str = Field(min_length=1, max_length=4000)
+    equals: str | int | float | bool | None
+
+
+class DelayScenarioStep(ScenarioStepBase):
+    type: Literal["delay"]
+    seconds: int = Field(ge=0, le=86_400)
+
+
+class MergeScenarioStep(ScenarioStepBase):
+    type: Literal["merge"]
+    mode: Literal["any", "all"] = "any"
 
 
 ScenarioStep = Annotated[
-    AgentScenarioStep | CommandScenarioStep | ReviewScenarioStep,
+    AgentScenarioStep
+    | CommandScenarioStep
+    | ReviewScenarioStep
+    | IfScenarioStep
+    | SwitchScenarioStep
+    | DelayScenarioStep
+    | MergeScenarioStep,
     Field(discriminator="type"),
 ]
 
@@ -502,6 +562,245 @@ class ScenarioManifest(StrictModel):
         return self
 
 
+class FlowPosition(StrictModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
+class FlowNode(StrictModel):
+    id: str
+    type: Literal[
+        "trigger",
+        "agent",
+        "command",
+        "review",
+        "if",
+        "switch",
+        "delay",
+        "merge",
+        "terminal",
+    ]
+    category: Literal["trigger", "execution", "control", "data", "terminal"]
+    title: str
+    subtitle: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    input_mapping: dict[str, str] = Field(default_factory=dict)
+    position: FlowPosition
+    read_only: bool = True
+
+
+class FlowEdge(StrictModel):
+    id: str
+    source: str
+    source_port: str
+    target: str
+    label: str
+    kind: Literal["event", "transition"]
+    outcome: Literal["SUCCESS", "FAILURE"] | None = None
+
+
+class FlowDefinition(StrictModel):
+    id: str
+    revision: int = Field(default=0, ge=0)
+    version: str
+    title: str
+    description: str | None = None
+    stage: Literal[
+        "analysis",
+        "development",
+        "testing",
+        "bug-finding",
+        "operations",
+        "system",
+    ]
+    enabled: bool
+    builtin: bool = True
+    read_only: bool = True
+    status: Literal["builtin", "draft", "published"] = "builtin"
+    source_scenario_id: str | None = None
+    start_node: str
+    nodes: list[FlowNode]
+    edges: list[FlowEdge]
+
+
+class FlowNodeType(StrictModel):
+    type: Literal[
+        "trigger",
+        "agent",
+        "command",
+        "review",
+        "if",
+        "switch",
+        "delay",
+        "merge",
+        "terminal",
+    ]
+    category: Literal["trigger", "execution", "control", "data", "terminal"]
+    title: str
+    description: str
+    version: int = Field(default=1, ge=1)
+    config_schema: dict[str, Any] = Field(default_factory=dict)
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    outcomes: list[Literal["EVENT", "SUCCESS", "FAILURE"]] = Field(default_factory=list)
+
+
+class AgentModelDefinition(StrictModel):
+    id: str = Field(min_length=1, max_length=200)
+    provider: Literal["openai", "openrouter"]
+    title: str = Field(min_length=1, max_length=200)
+    configured: bool = False
+    default: bool = False
+
+
+class CredentialReference(StrictModel):
+    id: str = Field(pattern=PLUGIN_PATTERN)
+    provider: Literal["openai", "openrouter", "gitea", "plane"]
+    title: str = Field(min_length=1, max_length=200)
+    configured: bool = False
+
+
+class OperationDefinition(StrictModel):
+    id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
+    version: int = Field(ge=1)
+    category: Literal["control", "data", "integration", "testing", "terminal"]
+    title: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=2000)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    outcomes: list[Literal["SUCCESS", "FAILURE"]]
+    errors: list[str] = Field(default_factory=list)
+    integrations: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    side_effects: bool = False
+    idempotency_required: bool = False
+    executor: str
+    examples: list[dict[str, Any]] = Field(default_factory=list)
+    legacy_command_compatible: bool = True
+
+
+class FlowCreateRequest(StrictModel):
+    source_flow_id: str | None = None
+    id: str | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    stage: Literal[
+        "analysis",
+        "development",
+        "testing",
+        "bug-finding",
+        "operations",
+        "system",
+    ] = "operations"
+
+    @field_validator("source_flow_id", "id")
+    @classmethod
+    def validate_flow_ids(cls, value: str | None) -> str | None:
+        if value is not None and not PLUGIN_PATTERN.fullmatch(value):
+            raise ValueError("flow identifiers must be kebab-case")
+        return value
+
+
+class FlowDraftUpdate(StrictModel):
+    expected_revision: int = Field(ge=1)
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=1000)
+    stage: Literal[
+        "analysis",
+        "development",
+        "testing",
+        "bug-finding",
+        "operations",
+        "system",
+    ]
+    enabled: bool = True
+    start_node: str
+    nodes: list[FlowNode]
+    edges: list[FlowEdge]
+
+
+class FlowPublishRequest(StrictModel):
+    expected_revision: int = Field(ge=1)
+
+
+class FlowValidationIssue(StrictModel):
+    code: str
+    message: str
+    node_id: str | None = None
+    edge_id: str | None = None
+
+
+class FlowValidationResult(StrictModel):
+    valid: bool
+    errors: list[FlowValidationIssue] = Field(default_factory=list)
+    warnings: list[FlowValidationIssue] = Field(default_factory=list)
+    sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class FlowVersion(StrictModel):
+    flow_id: str
+    version: int = Field(ge=1)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    definition: FlowDefinition
+    published_at: datetime
+
+
+class FlowRunRequest(StrictModel):
+    version: int | None = Field(default=None, ge=1)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActivatedFlowEdge(StrictModel):
+    activation_id: str
+    edge_id: str
+    source: str
+    target: str
+    outcome: Literal["SUCCESS", "FAILURE"] | None = None
+    node_run_id: str | None = None
+    activated_at: datetime
+
+
+class FlowNodeRun(StrictModel):
+    id: str
+    node_id: str
+    iteration: int = Field(ge=1)
+    attempt: int = Field(ge=1)
+    status: Literal[
+        "PENDING",
+        "READY",
+        "RUNNING",
+        "WAITING",
+        "COMPLETED",
+        "ERROR",
+        "CANCELLED",
+        "SKIPPED",
+    ]
+    outcome: Literal["SUCCESS", "FAILURE"] | None = None
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    data: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+    error: StepError | None = None
+    status_history: list[StepStatusChange] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+
+
+class FlowRun(StrictModel):
+    id: str
+    flow_id: str
+    flow_version: int = Field(ge=1)
+    flow_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    workflow_id: str
+    status: Literal["CREATED", "RUNNING", "WAITING", "COMPLETED", "FAILED", "CANCELLED"]
+    outcome: Literal["SUCCESS", "FAILURE"] | None = None
+    current_node: str | None = None
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    node_runs: list[FlowNodeRun] = Field(default_factory=list)
+    activated_edges: list[ActivatedFlowEdge] = Field(default_factory=list)
+    error: StepError | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class TriggerEvent(StrictModel):
     source: str = Field(min_length=1, max_length=100)
     event: str = Field(min_length=1, max_length=200)
@@ -516,6 +815,15 @@ class TriggerEvent(StrictModel):
         return value
 
 
+class FlowTriggerDispatch(StrictModel):
+    accepted: bool
+    source: str
+    event: str
+    event_id: str
+    flow_runs: list[FlowRun] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class AnalysisRequest(StrictModel):
     request: str = Field(min_length=3, max_length=20_000)
     title: str | None = Field(default=None, min_length=1, max_length=300)
@@ -524,6 +832,48 @@ class AnalysisRequest(StrictModel):
     @classmethod
     def normalize_text(cls, value: Any) -> Any:
         return value.strip() if isinstance(value, str) else value
+
+
+class BugFindingRequest(StrictModel):
+    repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", max_length=300)
+    ref: str = Field(default="main", min_length=1, max_length=300)
+    scope: str = Field(min_length=3, max_length=20_000)
+    symptoms: str | None = Field(default=None, min_length=1, max_length=20_000)
+    logs: str | None = Field(default=None, min_length=1, max_length=50_000)
+    constraints: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("repository", "ref", "scope", "symptoms", "logs", mode="before")
+    @classmethod
+    def normalize_bug_finding_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("repository")
+    @classmethod
+    def validate_repository(cls, value: str) -> str:
+        owner, name = value.split("/", maxsplit=1)
+        if owner in {".", ".."} or name in {".", ".."}:
+            raise ValueError("invalid repository name")
+        return value
+
+    @field_validator("ref")
+    @classmethod
+    def validate_ref(cls, value: str) -> str:
+        if (
+            re.fullmatch(r"[A-Za-z0-9._/-]+", value) is None
+            or ".." in value
+            or "//" in value
+            or value.endswith(("/", ".lock"))
+        ):
+            raise ValueError("invalid Git ref")
+        return value
+
+    @field_validator("constraints")
+    @classmethod
+    def normalize_constraints(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip() for value in values]
+        if any(not value or len(value) > 1000 for value in normalized):
+            raise ValueError("constraints must contain non-empty strings up to 1000 characters")
+        return normalized
 
 
 class IgnoredWebhook(StrictModel):
@@ -537,9 +887,18 @@ class PendingReview(StrictModel):
     iteration: int
     provider: Literal["gitea", "plane"] = "gitea"
     decision: Literal["review", "merge"] = "review"
+    inputs: dict[str, Any] = Field(default_factory=dict)
     repository: str | None = Field(default=None, max_length=300)
     pull_index: int | None = Field(default=None, ge=1)
     url: str | None = Field(default=None, max_length=4000)
+
+
+class PendingDelay(StrictModel):
+    step_id: str = Field(min_length=1, max_length=128)
+    execution_id: str
+    iteration: int = Field(ge=1)
+    available_at: datetime
+    inputs: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReviewDecision(StrictModel):
@@ -581,6 +940,7 @@ class WorkflowInstance(StrictModel):
     review_comments: list[str] = Field(default_factory=list)
     processed_event_ids: list[str] = Field(default_factory=list, max_length=1000)
     pending_review: PendingReview | None = None
+    pending_delay: PendingDelay | None = None
     pending_retry: PendingRetry | None = None
     error: StepError | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

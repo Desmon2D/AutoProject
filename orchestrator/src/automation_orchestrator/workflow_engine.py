@@ -16,6 +16,8 @@ from .models import (
     AgentScenarioStep,
     AgentStep,
     CommandScenarioStep,
+    DelayScenarioStep,
+    PendingDelay,
     PendingRetry,
     PendingReview,
     PreviousStepResult,
@@ -29,6 +31,7 @@ from .models import (
     WorkflowContext,
     WorkflowInstance,
 )
+from .node_runtime import NodeExecutionInput, NodeRuntime, NodeRuntimeError
 from .plugin_registry import PluginResolutionError
 from .sandbox_manager import SandboxExecutionError
 from .scenario_registry import ScenarioRegistry
@@ -51,6 +54,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         agent_service: AgentService,
         *,
         command_executor: CommandExecutor | None = None,
+        node_runtime: NodeRuntime | None = None,
         swirl_client: SwirlClient | None = None,
         audit_store: AuditStore | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -59,16 +63,36 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         self.scenarios = scenarios
         self.store = store
         self.agent_service = agent_service
-        self.command_executor = command_executor or CommandExecutor()
+        self._command_executor = command_executor or CommandExecutor()
+        self.node_runtime = node_runtime or NodeRuntime(self._command_executor)
         self.swirl_client = swirl_client
         self.audit_store = audit_store
         self.clock = clock or (lambda: datetime.now(UTC))
         self.max_transitions_per_run = max_transitions_per_run
         self._creation_lock = Lock()
 
+    @property
+    def command_executor(self) -> CommandExecutor:
+        return self._command_executor
+
+    @command_executor.setter
+    def command_executor(self, executor: CommandExecutor) -> None:
+        self._command_executor = executor
+        if hasattr(self, "node_runtime"):
+            self.node_runtime.command_executor = executor
+
     def create(self, event: TriggerEvent) -> tuple[WorkflowInstance, bool]:
         scenario = self.scenarios.match(event)
-        workflow_id = self.store.workflow_id(scenario, event)
+        return self.create_for_scenario(scenario, event)
+
+    def create_for_scenario(
+        self,
+        scenario: ScenarioManifest,
+        event: TriggerEvent,
+        *,
+        workflow_id: str | None = None,
+    ) -> tuple[WorkflowInstance, bool]:
+        workflow_id = workflow_id or self.store.workflow_id(scenario, event)
         with self._creation_lock:
             existing = self.store.get(workflow_id)
             if existing is not None:
@@ -101,9 +125,14 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             return workflow
         return self.advance(workflow)
 
-    def advance_safely(self, workflow: WorkflowInstance) -> WorkflowInstance:
+    def advance_safely(
+        self,
+        workflow: WorkflowInstance,
+        *,
+        transition_budget: int | None = None,
+    ) -> WorkflowInstance:
         try:
-            return self.advance(workflow)
+            return self.advance(workflow, transition_budget=transition_budget)
         except (OSError, RuntimeError, ValueError) as exc:
             workflow.status = "FAILED"
             workflow.outcome = None
@@ -140,19 +169,37 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         workflow.scenario_snapshot_sha256 = digest
         return scenario
 
-    def advance(self, workflow: WorkflowInstance) -> WorkflowInstance:
+    def advance(
+        self,
+        workflow: WorkflowInstance,
+        *,
+        transition_budget: int | None = None,
+    ) -> WorkflowInstance:
         scenario = self._scenario_for(workflow)
         if workflow.deadline_at is None:
             workflow.deadline_at = workflow.created_at + timedelta(seconds=scenario.timeout_seconds)
-        if workflow.status in {"WAITING", "COMPLETED", "FAILED", "CANCELLED"}:
+        if workflow.status in {"COMPLETED", "FAILED", "CANCELLED"}:
+            return workflow
+        if workflow.status == "WAITING" and workflow.pending_delay is None:
             return workflow
         terminal = self._external_terminal(workflow)
         if terminal is not None:
             return terminal
+        if workflow.pending_delay is not None:
+            if self.clock() < workflow.pending_delay.available_at:
+                return workflow
+            workflow = self._resume_delay(workflow, scenario)
+            if workflow.current_step is None:
+                workflow.status = "COMPLETED"
+                workflow.outcome = self._terminal_outcome(workflow)
+                return self._save(workflow)
+            if transition_budget is not None:
+                return workflow
         if self._deadline_exceeded(workflow):
             return self._save(workflow)
         workflow.status = "RUNNING"
-        for _ in range(self.max_transitions_per_run):
+        transition_limit = transition_budget or self.max_transitions_per_run
+        for _ in range(transition_limit):
             terminal = self._external_terminal(workflow)
             if terminal is not None:
                 return terminal
@@ -178,13 +225,26 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
                 workflow.iterations[step_id] = iteration
                 attempt = 1
             step = scenario.steps[step_id]
-            if isinstance(step, ReviewScenarioStep):
+            try:
+                node_execution = self.node_runtime.prepare(
+                    workflow=workflow,
+                    step_id=step_id,
+                    iteration=iteration,
+                    attempt=attempt,
+                    step=step,
+                )
+                preparation_error = None
+            except NodeRuntimeError as exc:
+                node_execution = None
+                preparation_error = exc
+            if isinstance(step, ReviewScenarioStep) and node_execution is not None:
                 review_ref = self._review_reference(workflow)
                 execution = self._begin_execution(
                     workflow,
                     step_id=step_id,
                     iteration=iteration,
                     attempt=attempt,
+                    inputs=node_execution.inputs,
                 )
                 self._change_execution_status(workflow, execution, "READY")
                 self._change_execution_status(workflow, execution, "WAITING")
@@ -195,7 +255,27 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
                     iteration=iteration,
                     provider=step.provider,
                     decision=step.decision,
+                    inputs=node_execution.inputs,
                     **review_ref,
+                )
+                return self._save(workflow)
+            if isinstance(step, DelayScenarioStep) and node_execution is not None:
+                execution = self._begin_execution(
+                    workflow,
+                    step_id=step_id,
+                    iteration=iteration,
+                    attempt=attempt,
+                    inputs=node_execution.inputs,
+                )
+                self._change_execution_status(workflow, execution, "READY")
+                self._change_execution_status(workflow, execution, "WAITING")
+                workflow.status = "WAITING"
+                workflow.pending_delay = PendingDelay(
+                    step_id=step_id,
+                    execution_id=execution.execution_id,
+                    iteration=iteration,
+                    available_at=self.clock() + timedelta(seconds=step.seconds),
+                    inputs=node_execution.inputs,
                 )
                 return self._save(workflow)
 
@@ -204,10 +284,21 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
                 step_id=step_id,
                 iteration=iteration,
                 attempt=attempt,
+                inputs=node_execution.inputs if node_execution is not None else {},
             )
             self._change_execution_status(workflow, execution, "READY")
             self._change_execution_status(workflow, execution, "RUNNING")
-            result = self._execute_once(workflow, step_id, iteration, attempt, step)
+            if preparation_error is not None:
+                result = self._technical_error(
+                    workflow,
+                    step_id,
+                    iteration,
+                    attempt,
+                    "NODE_INPUT_ERROR",
+                    str(preparation_error),
+                )
+            else:
+                result = self._execute_once(node_execution)
             self._finish_execution(workflow, execution.execution_id, result)
             terminal = self._external_terminal(workflow)
             if terminal is not None:
@@ -261,6 +352,14 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             workflow.error = None
             self._transition(workflow, step, result.outcome)
             self._save(workflow)
+            if transition_budget is not None:
+                if workflow.current_step is None:
+                    workflow.status = "COMPLETED"
+                    workflow.outcome = self._terminal_outcome(workflow)
+                    return self._save(workflow)
+                return workflow
+        if transition_budget is not None:
+            return self._save(workflow)
         workflow.status = "FAILED"
         workflow.outcome = None
         workflow.error = StepError(
@@ -337,6 +436,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
                 attempt=1,
                 execution_status="COMPLETED",
                 outcome=decision.outcome,
+                inputs=pending.inputs,
                 data={
                     "summary": "Gitea review completed",
                     "comments": decision.comments,
@@ -361,6 +461,46 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         self._save(workflow)
         return self.advance(workflow) if advance else workflow
 
+    def _resume_delay(
+        self,
+        workflow: WorkflowInstance,
+        scenario: ScenarioManifest,
+    ) -> WorkflowInstance:
+        pending = workflow.pending_delay
+        if pending is None:
+            raise WorkflowExecutionError("workflow has no pending delay")
+        if workflow.current_step != pending.step_id:
+            raise WorkflowExecutionError("pending delay does not match current step")
+        step = scenario.steps[pending.step_id]
+        if not isinstance(step, DelayScenarioStep):
+            raise WorkflowExecutionError("pending workflow step is not a delay")
+        self._finish_execution(
+            workflow,
+            pending.execution_id,
+            StepResult(
+                step_id=pending.step_id,
+                execution_id=pending.execution_id,
+                iteration=pending.iteration,
+                attempt=1,
+                execution_status="COMPLETED",
+                outcome="SUCCESS",
+                inputs=pending.inputs,
+                data={
+                    "summary": "Delay completed",
+                    "available_at": pending.available_at.isoformat(),
+                },
+            ),
+        )
+        workflow.pending_delay = None
+        workflow.status = "RUNNING"
+        self._transition(workflow, step, "SUCCESS")
+        self._audit(
+            workflow,
+            "workflow.delay.completed",
+            {"step_id": pending.step_id, "available_at": pending.available_at.isoformat()},
+        )
+        return self._save(workflow)
+
     def cancel(self, workflow_id: str, *, reason: str) -> WorkflowInstance:
         workflow = self.store.get(workflow_id)
         if workflow is None:
@@ -376,6 +516,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         workflow.cancel_requested_at = now
         workflow.cancelled_at = now
         workflow.pending_review = None
+        workflow.pending_delay = None
         workflow.pending_retry = None
         workflow.error = StepError(
             code="WORKFLOW_CANCELLED",
@@ -404,6 +545,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         workflow.outcome = None
         workflow.error = None
         workflow.pending_review = None
+        workflow.pending_delay = None
         workflow.pending_retry = None
         workflow.deadline_at = now + timedelta(seconds=scenario.timeout_seconds)
         workflow.cancel_requested_at = None
@@ -430,6 +572,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         workflow.status = "FAILED"
         workflow.outcome = None
         workflow.pending_review = None
+        workflow.pending_delay = None
         workflow.pending_retry = None
         workflow.error = error
         self._fail_active_execution(workflow, error)
@@ -470,6 +613,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         step_id: str,
         iteration: int,
         attempt: int,
+        inputs: dict[str, Any] | None = None,
     ) -> StepResult:
         now = self.clock()
         execution = StepResult(
@@ -479,6 +623,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             attempt=attempt,
             execution_status="PENDING",
             outcome=None,
+            inputs=inputs or {},
             status_history=[StepStatusChange(status="PENDING", occurred_at=now)],
         )
         workflow.executions.append(execution)
@@ -533,39 +678,39 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             },
         )
 
-    def _execute_once(
-        self,
-        workflow: WorkflowInstance,
-        step_id: str,
-        iteration: int,
-        attempt: int,
-        step: Any,
-    ) -> StepResult:
-        if isinstance(step, CommandScenarioStep):
-            try:
-                return self.command_executor.execute(
-                    workflow=workflow,
-                    step_id=step_id,
-                    iteration=iteration,
-                    attempt=attempt,
-                    step=step,
-                )
-            except WorkflowExecutionError as exc:
-                return self._technical_error(
-                    workflow, step_id, iteration, attempt, "COMMAND_ERROR", str(exc)
-                )
-        if isinstance(step, AgentScenarioStep):
-            return self._execute_agent(workflow, step_id, iteration, attempt, step)
-        raise WorkflowExecutionError("unsupported workflow step")
+    def _execute_once(self, execution: NodeExecutionInput) -> StepResult:
+        try:
+            return self.node_runtime.execute(
+                execution,
+                agent_executor=self._execute_agent,
+            )
+        except WorkflowExecutionError as exc:
+            code = (
+                "COMMAND_ERROR"
+                if isinstance(execution.step, CommandScenarioStep)
+                else "NODE_EXECUTION_ERROR"
+            )
+            return self._technical_error(
+                execution.workflow,
+                execution.step_id,
+                execution.iteration,
+                execution.attempt,
+                code,
+                str(exc),
+                inputs=execution.inputs,
+            )
 
     def _execute_agent(
         self,
-        workflow: WorkflowInstance,
-        step_id: str,
-        iteration: int,
-        attempt: int,
-        step: AgentScenarioStep,
+        execution: NodeExecutionInput,
     ) -> StepResult:
+        workflow = execution.workflow
+        step_id = execution.step_id
+        iteration = execution.iteration
+        attempt = execution.attempt
+        step = execution.step
+        if not isinstance(step, AgentScenarioStep):
+            raise WorkflowExecutionError("agent executor received a non-agent node")
         try:
             timeout_seconds = step.timeout_seconds
             if workflow.deadline_at is not None:
@@ -584,7 +729,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
                     model=step.model,
                     timeout_seconds=timeout_seconds,
                 ),
-                context=self._context(workflow, step),
+                context=self._context(workflow, step, node_inputs=execution.inputs),
             )
             result = self.agent_service.run(request)
             return self._validate_agent_result(
@@ -609,7 +754,13 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
                 workflow, step_id, iteration, attempt, "AGENT_EXECUTION_ERROR", str(exc)
             )
 
-    def _context(self, workflow: WorkflowInstance, step: AgentScenarioStep) -> WorkflowContext:
+    def _context(
+        self,
+        workflow: WorkflowInstance,
+        step: AgentScenarioStep,
+        *,
+        node_inputs: dict[str, Any] | None = None,
+    ) -> WorkflowContext:
         swirl_results: list[dict[str, Any]] = []
         retrieval_summary: dict[str, Any] = {}
         if step.context_search is not None:
@@ -655,6 +806,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             swirl_results = [item.model_dump(mode="json") for item in results]
         return WorkflowContext(
             trigger_data=workflow.trigger.data,
+            node_inputs=node_inputs or {},
             scenario={
                 "workflow_id": workflow.id,
                 "scenario_id": workflow.scenario_id,
@@ -684,6 +836,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         attempt: int,
         code: str,
         message: str,
+        inputs: dict[str, Any] | None = None,
     ) -> StepResult:
         return StepResult(
             step_id=step_id,
@@ -692,6 +845,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             attempt=attempt,
             execution_status="ERROR",
             outcome=None,
+            inputs=inputs or {},
             data={},
             artifacts=[],
             error=StepError(code=code, message=message, retryable=True),
@@ -714,6 +868,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         workflow.cancel_requested_at = workflow.cancel_requested_at or now
         workflow.cancelled_at = now
         workflow.pending_review = None
+        workflow.pending_delay = None
         workflow.pending_retry = None
         workflow.error = StepError(
             code="WORKFLOW_CANCELLED",
@@ -759,6 +914,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
         workflow.status = "FAILED"
         workflow.outcome = None
         workflow.pending_retry = None
+        workflow.pending_delay = None
         workflow.error = StepError(
             code="WORKFLOW_DEADLINE_EXCEEDED",
             message="workflow exceeded its overall deadline",
@@ -782,6 +938,7 @@ class WorkflowEngine(PlaneImplementationMixin, AgentResultValidationMixin):
             workflow.cancel_requested_at = workflow.cancel_requested_at or now
             workflow.cancelled_at = now
             workflow.pending_review = None
+            workflow.pending_delay = None
             workflow.pending_retry = None
             workflow.error = StepError(
                 code="WORKFLOW_CANCELLED",

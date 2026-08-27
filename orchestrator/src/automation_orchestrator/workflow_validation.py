@@ -37,6 +37,10 @@ class AgentResultValidationMixin:
             return self._validate_markdown_document_result(
                 workflow, step_id, iteration, attempt, result
             )
+        if step.result_contract == "bug_report":
+            return self._validate_bug_report_result(
+                workflow, step_id, iteration, attempt, result
+            )
         if step.result_contract == "test_change":
             return self._validate_test_change_result(workflow, step_id, iteration, attempt, result)
         if step.result_contract == "implementation_change":
@@ -119,6 +123,247 @@ class AgentResultValidationMixin:
                 "implementation iteration created a different pull request",
             )
         return result
+
+    def _validate_bug_report_result(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        result: StepResult,
+    ) -> StepResult:
+        report = result.data.get("bug_report")
+        repository_data = workflow.trigger.data.get("repository")
+        expected_repository = (
+            repository_data.get("full_name") if isinstance(repository_data, dict) else None
+        )
+        expected_ref = repository_data.get("ref") if isinstance(repository_data, dict) else None
+        if not isinstance(report, dict):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_INVALID",
+                "successful bug finding must return data.bug_report",
+            )
+
+        status = report.get("status")
+        findings = report.get("findings")
+        report_path = report.get("report_path")
+        inspected_commit = report.get("inspected_commit")
+        if (
+            report.get("repository") != expected_repository
+            or report.get("requested_ref") != expected_ref
+            or status not in {"FOUND", "NO_FINDINGS"}
+            or not isinstance(inspected_commit, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", inspected_commit) is None
+            or not isinstance(findings, list)
+            or len(findings) > 50
+            or (status == "FOUND" and not findings)
+            or (status == "NO_FINDINGS" and findings)
+            or not isinstance(report_path, str)
+        ):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_INVALID",
+                "bug report must identify the requested repository/ref, inspected commit, status, findings, and report path",
+            )
+
+        path = PurePosixPath(report_path)
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or path.as_posix() != report_path
+            or path.suffix.lower() != ".md"
+        ):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_INVALID",
+                "bug_report.report_path must be a safe relative Markdown path",
+            )
+
+        finding_ids: set[str] = set()
+        for finding in findings:
+            if not isinstance(finding, dict):
+                return self._invalid_bug_finding(
+                    workflow, step_id, iteration, attempt, "finding must be an object"
+                )
+            finding_id = finding.get("id")
+            evidence = finding.get("evidence")
+            reproduction = finding.get("reproduction")
+            reproducer = finding.get("reproducer")
+            if (
+                not isinstance(finding_id, str)
+                or re.fullmatch(r"BUG-[0-9]{3}", finding_id) is None
+                or finding_id in finding_ids
+                or not isinstance(finding.get("title"), str)
+                or not finding["title"].strip()
+                or len(finding["title"]) > 300
+                or finding.get("severity") not in {"critical", "high", "medium", "low"}
+                or finding.get("confidence") not in {"high", "medium", "low"}
+                or not isinstance(finding.get("root_cause"), str)
+                or not finding["root_cause"].strip()
+                or not isinstance(evidence, list)
+                or not evidence
+                or len(evidence) > 20
+                or not isinstance(reproduction, dict)
+                or not isinstance(reproducer, dict)
+            ):
+                return self._invalid_bug_finding(
+                    workflow,
+                    step_id,
+                    iteration,
+                    attempt,
+                    "finding fields, severity, confidence, evidence, reproduction, or reproducer are invalid",
+                )
+            finding_ids.add(finding_id)
+            if any(
+                not isinstance(item, dict)
+                or not isinstance(item.get("path"), str)
+                or not item["path"].strip()
+                or not isinstance(item.get("description"), str)
+                or not item["description"].strip()
+                or (
+                    item.get("line") is not None
+                    and (type(item.get("line")) is not int or item["line"] < 1)
+                )
+                for item in evidence
+            ):
+                return self._invalid_bug_finding(
+                    workflow, step_id, iteration, attempt, "finding evidence is invalid"
+                )
+            steps = reproduction.get("steps")
+            if (
+                not isinstance(steps, list)
+                or not steps
+                or len(steps) > 20
+                or any(not isinstance(item, str) or not item.strip() for item in steps)
+                or not isinstance(reproduction.get("expected"), str)
+                or not reproduction["expected"].strip()
+                or not isinstance(reproduction.get("actual"), str)
+                or not reproduction["actual"].strip()
+            ):
+                return self._invalid_bug_finding(
+                    workflow, step_id, iteration, attempt, "finding reproduction is invalid"
+                )
+            reproducer_path = reproducer.get("path")
+            command = reproducer.get("command")
+            content = reproducer.get("content")
+            reproducer_parts = (
+                PurePosixPath(reproducer_path) if isinstance(reproducer_path, str) else None
+            )
+            if (
+                reproducer_parts is None
+                or reproducer_parts.is_absolute()
+                or ".." in reproducer_parts.parts
+                or reproducer_parts.as_posix() != reproducer_path
+                or not reproducer_path.startswith("reproducers/")
+                or not isinstance(command, list)
+                or not 1 <= len(command) <= 32
+                or any(
+                    not isinstance(item, str) or not item or len(item) > 1000
+                    for item in command
+                )
+                or not isinstance(content, str)
+                or not content.strip()
+                or len(content.encode("utf-8")) > 256 * 1024
+            ):
+                return self._invalid_bug_finding(
+                    workflow, step_id, iteration, attempt, "finding reproducer is invalid"
+                )
+
+        matching_artifacts = [
+            artifact
+            for artifact in result.artifacts
+            if artifact.type in {"report", "document", "file"}
+            and self._artifact_relative_path(artifact, result.execution_id) == report_path
+        ]
+        if len(matching_artifacts) != 1:
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_ARTIFACT_INVALID",
+                "successful bug finding must return exactly one matching Markdown report artifact",
+            )
+        stored = self.agent_service.job_store.artifact(result.execution_id, report_path)
+        try:
+            if stored is None or stored.stat().st_size > 2 * 1024 * 1024:
+                raise ValueError("bug report is missing or exceeds 2 MiB")
+            content = stored.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError, ValueError) as exc:
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_ARTIFACT_INVALID",
+                str(exc),
+            )
+        if len(content) < 100 or not content.startswith("# "):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_ARTIFACT_INVALID",
+                "bug report must start with a level-1 heading and contain substantive text",
+            )
+        if any(finding_id not in content for finding_id in finding_ids):
+            return self._technical_error(
+                workflow,
+                step_id,
+                iteration,
+                attempt,
+                "AGENT_BUG_REPORT_ARTIFACT_INVALID",
+                "bug report artifact must mention every structured finding id",
+            )
+
+        canonical_uri = f"artifact://{result.execution_id}/{report_path}"
+        report_artifact = matching_artifacts[0].model_copy(
+            update={"type": "report", "uri": canonical_uri}
+        )
+        return result.model_copy(
+            update={
+                "data": {**result.data, "bug_report": report},
+                "artifacts": [
+                    report_artifact if item is matching_artifacts[0] else item
+                    for item in result.artifacts
+                ],
+            }
+        )
+
+    def _invalid_bug_finding(
+        self,
+        workflow: WorkflowInstance,
+        step_id: str,
+        iteration: int,
+        attempt: int,
+        message: str,
+    ) -> StepResult:
+        return self._technical_error(
+            workflow,
+            step_id,
+            iteration,
+            attempt,
+            "AGENT_BUG_FINDING_INVALID",
+            message,
+        )
+
+    @staticmethod
+    def _artifact_relative_path(artifact: ArtifactRef, execution_id: str) -> str | None:
+        if not artifact.uri.startswith("artifact://"):
+            return None
+        path = artifact.uri.removeprefix("artifact://").lstrip("/")
+        return path.removeprefix(f"{execution_id}/")
 
     def _validate_markdown_document_result(
         self,
@@ -432,11 +677,21 @@ class AgentResultValidationMixin:
         gitea_client = self.command_executor.gitea_client
         if gitea_client is not None:
             try:
-                gitea_client.verify_branch(
-                    repository=repository,
-                    branch=branch,
-                    commit=commit,
-                )
+                if changed is False:
+                    # With no authored changes, the implementation commit is
+                    # already the complete test payload. Materialize the
+                    # stable workflow ref if the agent omitted that no-op push.
+                    gitea_client.ensure_branch(
+                        repository=repository,
+                        branch=branch,
+                        commit=commit,
+                    )
+                else:
+                    gitea_client.verify_branch(
+                        repository=repository,
+                        branch=branch,
+                        commit=commit,
+                    )
                 gitea_client.verify_descendant(
                     repository=repository,
                     ancestor=base_commit,

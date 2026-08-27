@@ -1,6 +1,7 @@
 param(
     [string]$BookStackContainer = "harnes-bookstack-1",
     [string]$BookStackDatabaseContainer = "harnes-bookstack-db-1",
+    [string]$AutomationNetwork = "automation_default",
     [string]$Query = "payment retry idempotency"
 )
 
@@ -41,8 +42,8 @@ if ($LASTEXITCODE -ne 0) { throw "Cannot start BookStack containers" }
 
 $networks = & $docker inspect $BookStackContainer --format "{{json .NetworkSettings.Networks}}"
 if ($LASTEXITCODE -ne 0) { throw "Cannot inspect BookStack container" }
-if ($networks -notmatch 'autoproject_default') {
-    & $docker network connect --alias bookstack autoproject_default $BookStackContainer
+if ($networks -notmatch [regex]::Escape($AutomationNetwork)) {
+    & $docker network connect --alias bookstack $AutomationNetwork $BookStackContainer
     if ($LASTEXITCODE -ne 0) { throw "Cannot connect BookStack to AutoProject network" }
 }
 

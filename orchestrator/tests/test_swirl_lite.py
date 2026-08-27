@@ -1,4 +1,4 @@
-from automation_orchestrator.swirl_lite import build_response, search_documents
+from automation_orchestrator.swirl_lite import build_response, find_document, search_documents
 
 
 def test_searches_local_bookstack_documents():
@@ -51,3 +51,21 @@ def test_builds_swirl_compatible_grouped_response():
     assert response["info"]["search"]["id"]
     assert response["results"][0]["searchprovider"] == "Local BookStack"
     assert response["results"][0]["json_results"][0]["url"] == "http://bookstack/retry"
+    document_id = response["results"][0]["json_results"][0]["document_id"]
+    assert find_document(documents, f"http://bookstack/api/pages/{document_id}") == documents[0]
+
+
+def test_finds_document_with_explicit_identifier():
+    document = {
+        "document_id": "retry-runbook",
+        "title": "Payment retry runbook",
+        "body": "Use bounded backoff",
+        "url": "http://bookstack/retry",
+        "source": "Local BookStack",
+        "date_published": "2026-08-18",
+    }
+
+    assert find_document(
+        [document],
+        "http://bookstack/api/pages/retry-runbook",
+    ) == document

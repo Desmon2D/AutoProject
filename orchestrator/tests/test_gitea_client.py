@@ -1,5 +1,6 @@
 import io
 import json
+from urllib.error import HTTPError
 
 import pytest
 
@@ -105,6 +106,43 @@ def test_verifies_remote_branch_commit():
             branch="automation/wf-1",
             commit="b" * 40,
         )
+
+
+def test_ensures_missing_branch_at_exact_commit():
+    requests = []
+    responses = iter(
+        [
+            HTTPError("url", 404, "missing", {}, io.BytesIO(b"missing")),
+            {"name": "automation/wf-1", "commit": {"id": "a" * 40}},
+            {"commit": {"id": "a" * 40}},
+        ]
+    )
+
+    def opener(request, **_kwargs):
+        requests.append(request)
+        response = next(responses)
+        if isinstance(response, HTTPError):
+            raise response
+        return Response(json.dumps(response).encode())
+
+    client = GiteaClient(
+        "http://gitea:3000",
+        "secret",
+        {"team/service"},
+        opener=opener,
+    )
+
+    client.ensure_branch(
+        repository="team/service",
+        branch="automation/wf-1",
+        commit="a" * 40,
+    )
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert json.loads(requests[1].data) == {
+        "new_branch_name": "automation/wf-1",
+        "old_ref_name": "a" * 40,
+    }
 
 
 def test_verifies_commit_ancestry_from_gitea_graph():

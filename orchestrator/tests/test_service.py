@@ -44,6 +44,51 @@ def test_prepare_creates_sandbox_task(image_resolver, tmp_path: Path):
     assert "A-1" in prepared.task["prompt"]
 
 
+def test_run_persists_context_usage_without_raw_prompt(
+    image_resolver, tmp_path: Path, monkeypatch
+):
+    sandbox = SandboxManager(tmp_path)
+    service = AgentService(ContextBuilder(), image_resolver, sandbox)
+    request = AgentRunRequest(
+        execution_id="exec-context-usage",
+        workflow_id="wf-context-usage",
+        step=AgentStep(
+            id="investigate",
+            prompt="Investigate the retry defect",
+            model="test-model",
+        ),
+        context=WorkflowContext(
+            trigger_data={
+                "scope": "payment retries",
+                "repository": {"full_name": "team/service", "ref": "main"},
+            }
+        ),
+    )
+
+    monkeypatch.setattr(
+        sandbox,
+        "run",
+        lambda **_kwargs: SandboxResult(
+            job_id=request.execution_id,
+            status="success",
+            summary="Investigation complete",
+        ),
+    )
+
+    result = service.run(request)
+
+    usage = result.data["context_usage"]
+    assert usage["digest"]
+    assert usage["character_count"] > 0
+    assert {item["source"] for item in usage["sources"]} >= {
+        "execution_contract",
+        "task",
+        "requirements",
+        "repository",
+    }
+    assert "prompt" not in usage
+
+
 def test_normalizes_native_business_failure():
     request = AgentRunRequest(
         execution_id="exec-failure",
@@ -67,7 +112,85 @@ def test_normalizes_native_business_failure():
     assert result.outcome == "FAILURE"
     assert result.error is None
     assert result.data["reason"] == "repository_missing"
-    assert result.artifacts[0].uri == "artifact://failure.md"
+    assert result.artifacts[0].uri == "artifact://exec-failure/failure.md"
+
+
+def test_normalizes_absolute_sandbox_output_artifact_uri():
+    request = AgentRunRequest(
+        execution_id="exec-output-artifact",
+        workflow_id="wf-1",
+        step=AgentStep(id="investigate", prompt="Investigate", model="test-model"),
+    )
+    sandbox_result = SandboxResult(
+        job_id=request.execution_id,
+        status="success",
+        summary="Report created",
+        artifacts=[
+            {
+                "type": "report",
+                "uri": "/output/bug-report.md",
+                "summary": "Bug report",
+            }
+        ],
+    )
+
+    result = AgentService._normalize(request, sandbox_result)
+
+    assert result.artifacts[0].uri == (
+        "artifact://exec-output-artifact/bug-report.md"
+    )
+
+
+def test_normalizes_shorthand_artifact_uri():
+    request = AgentRunRequest(
+        execution_id="exec-short-artifact",
+        workflow_id="wf-1",
+        step=AgentStep(id="investigate", prompt="Investigate", model="test-model"),
+    )
+    sandbox_result = SandboxResult(
+        job_id=request.execution_id,
+        status="success",
+        summary="Report created",
+        artifacts=[{"type": "report", "uri": "artifact://bug-report.md"}],
+    )
+
+    result = AgentService._normalize(request, sandbox_result)
+
+    assert result.artifacts[0].uri == (
+        "artifact://exec-short-artifact/bug-report.md"
+    )
+
+
+def test_normalizes_flat_bug_report_payload():
+    request = AgentRunRequest(
+        execution_id="exec-flat-bug-report",
+        workflow_id="wf-1",
+        step=AgentStep(
+            id="find-bugs",
+            prompt="Investigate",
+            model="test-model",
+        ),
+    )
+    report = {
+        "repository": "team/service",
+        "requested_ref": "main",
+        "inspected_commit": "a" * 40,
+        "status": "NO_FINDINGS",
+        "report_path": "bug-report.md",
+        "findings": [],
+    }
+    sandbox_result = SandboxResult(
+        job_id=request.execution_id,
+        status="success",
+        summary="Investigation complete",
+        data={**report, "diagnostic": "preserved"},
+    )
+
+    result = AgentService._normalize(request, sandbox_result)
+
+    assert result.data["bug_report"] == report
+    assert result.data["diagnostic"] == "preserved"
+    assert "repository" not in result.data
 
 
 def test_gitea_environment_is_allowlisted(image_resolver, monkeypatch, tmp_path: Path):

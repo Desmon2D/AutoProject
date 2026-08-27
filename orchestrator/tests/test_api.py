@@ -225,6 +225,47 @@ def test_analysis_request_produces_downloadable_markdown(
     assert client.post("/v1/analysis", json={"request": "  "}).status_code == 422
 
 
+def test_bug_finding_request_enqueues_validated_manual_workflow(
+    image_resolver, tmp_path: Path
+):
+    sandbox = SandboxManager(tmp_path / "jobs")
+    service = AgentService(ContextBuilder(), image_resolver, sandbox)
+    service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    service.workflow_engine = WorkflowEngine(
+        service.scenario_registry,
+        WorkflowStore(tmp_path / "workflows"),
+        service,
+    )
+    client = TestClient(create_app(service))
+
+    response = client.post(
+        "/v1/bug-finding",
+        json={
+            "repository": "team/service",
+            "ref": "release/1.2",
+            "scope": "Investigate duplicate payment retries",
+            "symptoms": "A payment can be submitted twice after a timeout",
+            "constraints": ["Do not modify production code"],
+        },
+    )
+
+    assert response.status_code == 202
+    created = response.json()
+    assert created["scenario_id"] == "bug-finding"
+    assert created["trigger"]["data"]["repository"] == {
+        "full_name": "team/service",
+        "ref": "release/1.2",
+    }
+    assert created["trigger"]["data"]["search_query"].startswith(
+        "Investigate duplicate payment retries"
+    )
+    assert service.workflow_queue.get(created["id"]).status == "PENDING"
+    assert client.post(
+        "/v1/bug-finding",
+        json={"repository": "../unsafe", "scope": "invalid repository"},
+    ).status_code == 422
+
+
 def test_cancel_pending_workflow_endpoint(image_resolver, tmp_path: Path):
     sandbox = SandboxManager(tmp_path / "jobs")
     service = AgentService(ContextBuilder(), image_resolver, sandbox)
@@ -1070,3 +1111,161 @@ def test_implement_ticket_produces_branch_ready_for_testing(
         "development_review",
         "approved_for_testing",
     ]
+
+
+def test_flow_builder_read_endpoints(image_resolver, tmp_path: Path):
+    service = AgentService(ContextBuilder(), image_resolver, SandboxManager(tmp_path / "jobs"))
+    service.scenario_registry = ScenarioRegistry(Path(__file__).parents[1] / "scenarios")
+    client = TestClient(create_app(service))
+
+    node_types = client.get("/v1/node-types")
+    assert node_types.status_code == 200
+    assert {item["type"] for item in node_types.json()} == {
+        "trigger",
+        "agent",
+        "command",
+        "review",
+        "if",
+        "switch",
+        "delay",
+        "merge",
+        "terminal",
+    }
+    operations = client.get("/v1/operations")
+    assert operations.status_code == 200
+    assert any(item["id"] == "complete" for item in operations.json())
+    models = client.get("/v1/models")
+    assert models.status_code == 200
+    assert any(
+        item["provider"] == "openrouter" and item["id"] == "openai/gpt-4.1"
+        for item in models.json()
+    )
+    credentials = client.get("/v1/credentials")
+    assert credentials.status_code == 200
+    assert {item["id"] for item in credentials.json()} == {
+        "openai-default",
+        "openrouter-default",
+        "gitea-default",
+        "plane-default",
+    }
+
+    flows = client.get("/v1/flows")
+    assert flows.status_code == 200
+    bug_finding = next(item for item in flows.json() if item["id"] == "bug-finding")
+    assert bug_finding["read_only"] is True
+    assert bug_finding["builtin"] is True
+    assert bug_finding["nodes"][0]["id"] == "__trigger__"
+
+    flow = client.get("/v1/flows/bug-finding")
+    assert flow.status_code == 200
+    assert flow.json() == bug_finding
+    assert client.get("/v1/flows/missing-flow").status_code == 404
+
+    blank_response = client.post(
+        "/v1/flows",
+        json={"id": "blank-workflow", "title": "Blank workflow", "stage": "testing"},
+    )
+    assert blank_response.status_code == 201
+    blank = blank_response.json()
+    assert blank["title"] == "Blank workflow"
+    assert blank["stage"] == "testing"
+    assert blank["start_node"] == ""
+    assert blank["nodes"] == []
+    assert blank["edges"] == []
+    assert blank["read_only"] is False
+
+    created_response = client.post(
+        "/v1/flows",
+        json={"source_flow_id": "bug-finding", "id": "bug-finding-copy"},
+    )
+    assert created_response.status_code == 201
+    created = created_response.json()
+    assert created["revision"] == 1
+    assert created["status"] == "draft"
+    assert created["read_only"] is False
+
+    edited_nodes = [dict(node) for node in created["nodes"]]
+    edited_nodes.append(
+        {
+            "id": "command-1",
+            "type": "command",
+            "category": "execution",
+            "title": "Complete flow",
+            "subtitle": "complete",
+            "config": {
+                "command": "complete",
+                "parameters": {},
+                "retry": {
+                    "max_attempts": 1,
+                    "delay_seconds": 5,
+                    "backoff": "exponential",
+                    "max_delay_seconds": 300,
+                },
+            },
+            "position": {"x": 600, "y": 500},
+            "read_only": False,
+        }
+    )
+    edited_edges = [dict(edge) for edge in created["edges"]]
+    start_success = next(
+        edge
+        for edge in edited_edges
+        if edge["source"] == created["start_node"] and edge["source_port"] == "SUCCESS"
+    )
+    start_success["target"] = "command-1"
+    start_success["id"] = f"{created['start_node']}:SUCCESS:command-1"
+    edited_edges.extend(
+        [
+            {
+                "id": "command-1:SUCCESS:__success__",
+                "source": "command-1",
+                "source_port": "SUCCESS",
+                "target": "__success__",
+                "label": "SUCCESS",
+                "kind": "transition",
+                "outcome": "SUCCESS",
+            },
+            {
+                "id": "command-1:FAILURE:__failure__",
+                "source": "command-1",
+                "source_port": "FAILURE",
+                "target": "__failure__",
+                "label": "FAILURE",
+                "kind": "transition",
+                "outcome": "FAILURE",
+            },
+        ]
+    )
+    update_payload = {
+        "expected_revision": created["revision"],
+        "title": "Editable bug finder",
+        "description": created["description"],
+        "stage": created["stage"],
+        "enabled": created["enabled"],
+        "start_node": created["start_node"],
+        "nodes": edited_nodes,
+        "edges": edited_edges,
+    }
+    updated_response = client.put(
+        "/v1/flows/bug-finding-copy/draft", json=update_payload
+    )
+    assert updated_response.status_code == 200
+    updated = updated_response.json()
+    assert updated["revision"] == 2
+    assert updated["title"] == "Editable bug finder"
+    assert any(node["id"] == "command-1" for node in updated["nodes"])
+    assert client.put("/v1/flows/bug-finding-copy/draft", json=update_payload).status_code == 409
+
+    validation = client.post("/v1/flows/bug-finding-copy/validate")
+    assert validation.status_code == 200
+    assert validation.json()["valid"] is True
+
+    published_response = client.post(
+        "/v1/flows/bug-finding-copy/publish", json={"expected_revision": 2}
+    )
+    assert published_response.status_code == 200
+    published = published_response.json()
+    assert published["version"] == 1
+    assert len(published["sha256"]) == 64
+    versions = client.get("/v1/flows/bug-finding-copy/versions").json()
+    assert versions == [published]

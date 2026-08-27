@@ -15,7 +15,9 @@ WORKFLOW_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class GiteaClientError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class GiteaClient:
@@ -129,6 +131,32 @@ class GiteaClient:
         if remote_id != commit:
             raise GiteaClientError("remote branch does not point to the reported commit")
 
+    def ensure_branch(self, *, repository: str, branch: str, commit: str) -> None:
+        """Create an absent branch at an exact existing commit, then verify it."""
+        self._validate_repository(repository)
+        self._validate_ref(branch)
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+            raise GiteaClientError("branch commit must be a full Git hash")
+        try:
+            self.verify_branch(repository=repository, branch=branch, commit=commit)
+            return
+        except GiteaClientError as exc:
+            if exc.status_code != 404:
+                raise
+
+        root = self._repository_root(repository)
+        try:
+            self._request(
+                "POST",
+                f"{root}/branches",
+                {"new_branch_name": branch, "old_ref_name": commit},
+            )
+        except GiteaClientError as exc:
+            # A concurrent retry may have created the same stable branch.
+            if exc.status_code != 409:
+                raise
+        self.verify_branch(repository=repository, branch=branch, commit=commit)
+
     def default_branch(self, repository: str) -> str:
         root = self._repository_root(repository)
         payload = self._request("GET", root)
@@ -199,7 +227,9 @@ class GiteaClient:
                 return response.read()
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise GiteaClientError(f"Gitea returned HTTP {exc.code}: {detail}") from exc
+            raise GiteaClientError(
+                f"Gitea returned HTTP {exc.code}: {detail}", status_code=exc.code
+            ) from exc
         except (URLError, OSError) as exc:
             raise GiteaClientError(f"Gitea request failed: {exc}") from exc
 
@@ -220,7 +250,9 @@ class GiteaClient:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise GiteaClientError(f"Gitea returned HTTP {exc.code}: {detail}") from exc
+            raise GiteaClientError(
+                f"Gitea returned HTTP {exc.code}: {detail}", status_code=exc.code
+            ) from exc
         except (URLError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GiteaClientError(f"Gitea request failed: {exc}") from exc
 

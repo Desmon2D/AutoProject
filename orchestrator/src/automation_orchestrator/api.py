@@ -15,20 +15,44 @@ from fastapi.responses import FileResponse
 from .audit_store import AuditStore
 from .bootstrap import build_service
 from .capability_registry import CapabilityResolutionError
+from .flow_builder import builtin_node_types, scenario_to_flow
+from .flow_store import (
+    FlowAlreadyExists,
+    FlowNotFound,
+    FlowRevisionConflict,
+    FlowStore,
+)
+from .flow_validation import validate_flow
+from .graph_run_store import GraphRunStore
+from .graph_runtime import GraphRuntime, GraphRuntimeError
 from .image_builder import ImageBuildError
 from .image_registry import ImageResolutionError
 from .job_store import IdempotencyConflict
 from .models import (
     IDENTIFIER_PATTERN,
+    AgentModelDefinition,
     AgentRunRequest,
     AnalysisRequest,
     ArtifactCleanupResult,
     ArtifactRecord,
     AuditEvent,
+    BugFindingRequest,
     BuiltContext,
     CapabilityManifest,
+    CredentialReference,
+    FlowCreateRequest,
+    FlowDefinition,
+    FlowDraftUpdate,
+    FlowNodeType,
+    FlowPublishRequest,
+    FlowRun,
+    FlowRunRequest,
+    FlowTriggerDispatch,
+    FlowValidationResult,
+    FlowVersion,
     IgnoredWebhook,
     ImageProfileManifest,
+    OperationDefinition,
     PluginManifest,
     PreparedAgentStep,
     ReviewDecision,
@@ -39,6 +63,7 @@ from .models import (
     WorkflowActionRequest,
     WorkflowInstance,
 )
+from .operation_catalog import builtin_operations
 from .plane_client import PlaneClientError
 from .plane_webhook import (
     PlaneWebhookError,
@@ -47,6 +72,7 @@ from .plane_webhook import (
     parse_project_repositories,
 )
 from .plugin_registry import PluginResolutionError
+from .runtime_catalog import agent_models, credential_references
 from .sandbox_manager import SandboxExecutionError
 from .scenario_registry import ScenarioResolutionError
 from .service import AgentService
@@ -116,6 +142,58 @@ def _review_comments(payload: dict[str, Any]) -> list[str]:
     return comments
 
 
+def _resolve_flow(request: Request, flow_id: str) -> FlowDefinition:
+    store: FlowStore = request.app.state.service.flow_store
+    draft = store.get(flow_id)
+    if draft is not None:
+        return draft
+    registry = getattr(request.app.state.service, "scenario_registry", None)
+    if registry is None:
+        raise HTTPException(status_code=503, detail="workflow engine is not configured")
+    try:
+        return scenario_to_flow(registry.get(flow_id))
+    except ScenarioResolutionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _next_copy_id(request: Request, source_id: str) -> str:
+    store: FlowStore = request.app.state.service.flow_store
+    registry = getattr(request.app.state.service, "scenario_registry", None)
+    builtin_ids = {item.id for item in registry.list()} if registry is not None else set()
+    base = f"{source_id[:54]}-copy"
+    for sequence in range(1, 1000):
+        candidate = base if sequence == 1 else f"{base[:59]}-{sequence}"
+        if candidate not in builtin_ids and store.get(candidate) is None:
+            return candidate
+    raise HTTPException(status_code=409, detail="could not allocate flow copy id")
+
+
+def _next_blank_flow_id(request: Request) -> str:
+    store: FlowStore = request.app.state.service.flow_store
+    registry = getattr(request.app.state.service, "scenario_registry", None)
+    builtin_ids = {item.id for item in registry.list()} if registry is not None else set()
+    for sequence in range(1, 1000):
+        candidate = "new-workflow" if sequence == 1 else f"new-workflow-{sequence}"
+        if candidate not in builtin_ids and store.get(candidate) is None:
+            return candidate
+    raise HTTPException(status_code=409, detail="could not allocate flow id")
+
+
+def _dispatch_published_flows(service: AgentService, event: TriggerEvent) -> FlowTriggerDispatch:
+    runtime = getattr(service, "graph_runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="graph runtime is not configured")
+    runs = runtime.start_matching(event)
+    return FlowTriggerDispatch(
+        accepted=bool(runs),
+        source=event.source,
+        event=event.event,
+        event_id=event.event_id,
+        flow_runs=runs,
+        reason=None if runs else "no published flow matches trigger",
+    )
+
+
 def create_app(service: AgentService | None = None) -> FastAPI:
     application = FastAPI(title="Automation Orchestrator", version="0.1.0")
     dashboard_origins = [
@@ -129,7 +207,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
     application.add_middleware(
         CORSMiddleware,
         allow_origins=dashboard_origins,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["*"],
     )
     current_service = service or build_service()
@@ -141,7 +219,21 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         current_service.audit_store = AuditStore(
             current_service.sandbox_manager.jobs_root / "audit.sqlite3"
         )
+    if not hasattr(current_service, "flow_store"):
+        current_service.flow_store = FlowStore(
+            current_service.sandbox_manager.jobs_root / "flows.sqlite3"
+        )
     workflow_engine = getattr(current_service, "workflow_engine", None)
+    if workflow_engine is not None and not hasattr(current_service, "graph_runtime"):
+        current_service.graph_run_store = GraphRunStore(
+            current_service.sandbox_manager.jobs_root / "graph-runs.sqlite3"
+        )
+        current_service.graph_runtime = GraphRuntime(
+            current_service.flow_store,
+            current_service.graph_run_store,
+            workflow_engine,
+            current_service.workflow_queue,
+        )
     if workflow_engine is not None and getattr(workflow_engine, "audit_store", None) is None:
         workflow_engine.audit_store = current_service.audit_store
     application.state.service = current_service
@@ -238,6 +330,313 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
         return registry.list()
 
+    @application.get("/v1/node-types", response_model=list[FlowNodeType])
+    def node_types() -> list[FlowNodeType]:
+        return builtin_node_types()
+
+    @application.get("/v1/operations", response_model=list[OperationDefinition])
+    def operations() -> list[OperationDefinition]:
+        return builtin_operations()
+
+    @application.get("/v1/models", response_model=list[AgentModelDefinition])
+    def models(request: Request) -> list[AgentModelDefinition]:
+        registry = getattr(request.app.state.service, "scenario_registry", None)
+        scenarios = registry.list() if registry is not None else []
+        return agent_models(scenarios)
+
+    @application.get("/v1/credentials", response_model=list[CredentialReference])
+    def credentials() -> list[CredentialReference]:
+        return credential_references()
+
+    @application.get("/v1/flows", response_model=list[FlowDefinition])
+    def flows(request: Request) -> list[FlowDefinition]:
+        registry = getattr(request.app.state.service, "scenario_registry", None)
+        if registry is None:
+            raise HTTPException(status_code=503, detail="workflow engine is not configured")
+        builtins = [scenario_to_flow(scenario) for scenario in registry.list()]
+        return [*builtins, *request.app.state.service.flow_store.list()]
+
+    @application.post(
+        "/v1/flows",
+        response_model=FlowDefinition,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_flow(payload: FlowCreateRequest, request: Request) -> FlowDefinition:
+        store: FlowStore = request.app.state.service.flow_store
+        source = (
+            _resolve_flow(request, payload.source_flow_id)
+            if payload.source_flow_id is not None
+            else None
+        )
+        flow_id = payload.id or (
+            _next_copy_id(request, source.id)
+            if source is not None
+            else _next_blank_flow_id(request)
+        )
+        registry = getattr(request.app.state.service, "scenario_registry", None)
+        if store.get(flow_id) is not None or (
+            registry is not None and any(item.id == flow_id for item in registry.list())
+        ):
+            raise HTTPException(status_code=409, detail=f"flow already exists: {flow_id}")
+        if source is not None:
+            candidate = source.model_copy(
+                update={
+                    "id": flow_id,
+                    "title": payload.title or f"Копия: {source.title}"[:200],
+                    "revision": 1,
+                    "version": "draft",
+                    "builtin": False,
+                    "read_only": False,
+                    "status": "draft",
+                    "nodes": [
+                        node.model_copy(update={"read_only": False})
+                        for node in source.nodes
+                    ],
+                    "source_scenario_id": source.source_scenario_id or source.id,
+                }
+            )
+        else:
+            candidate = FlowDefinition(
+                id=flow_id,
+                revision=1,
+                version="draft",
+                title=payload.title or "Новый workflow",
+                description=None,
+                stage=payload.stage,
+                enabled=True,
+                builtin=False,
+                read_only=False,
+                status="draft",
+                source_scenario_id=None,
+                start_node="",
+                nodes=[],
+                edges=[],
+            )
+        try:
+            created = store.create(candidate)
+        except FlowAlreadyExists as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _audit_request(
+            request,
+            action="flow.created",
+            resource_type="flow",
+            resource_id=created.id,
+            details={
+                "source_flow_id": source.id if source is not None else None,
+                "revision": created.revision,
+            },
+        )
+        return created
+
+    @application.get("/v1/flows/{flow_id}", response_model=FlowDefinition)
+    def flow(flow_id: str, request: Request) -> FlowDefinition:
+        return _resolve_flow(request, flow_id)
+
+    @application.put("/v1/flows/{flow_id}/draft", response_model=FlowDefinition)
+    def update_flow_draft(
+        flow_id: str, payload: FlowDraftUpdate, request: Request
+    ) -> FlowDefinition:
+        store: FlowStore = request.app.state.service.flow_store
+        current = store.get(flow_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail=f"unknown draft: {flow_id}")
+        candidate = current.model_copy(
+            update={
+                "title": payload.title,
+                "description": payload.description,
+                "stage": payload.stage,
+                "enabled": payload.enabled,
+                "start_node": payload.start_node,
+                "nodes": [
+                    node.model_copy(update={"read_only": False}) for node in payload.nodes
+                ],
+                "edges": payload.edges,
+            }
+        )
+        try:
+            updated = store.save(candidate, expected_revision=payload.expected_revision)
+        except FlowRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FlowNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _audit_request(
+            request,
+            action="flow.draft.updated",
+            resource_type="flow",
+            resource_id=updated.id,
+            details={"revision": updated.revision},
+        )
+        return updated
+
+    @application.delete("/v1/flows/{flow_id}/draft")
+    def delete_flow_draft(flow_id: str, expected_revision: int, request: Request) -> dict:
+        store: FlowStore = request.app.state.service.flow_store
+        try:
+            store.delete(flow_id, expected_revision=expected_revision)
+        except FlowRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FlowNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _audit_request(
+            request,
+            action="flow.draft.deleted",
+            resource_type="flow",
+            resource_id=flow_id,
+            details={"revision": expected_revision},
+        )
+        return {"deleted": True, "flow_id": flow_id}
+
+    @application.post(
+        "/v1/flows/{flow_id}/validate", response_model=FlowValidationResult
+    )
+    def validate_flow_definition(flow_id: str, request: Request) -> FlowValidationResult:
+        return validate_flow(_resolve_flow(request, flow_id))
+
+    @application.post("/v1/flows/{flow_id}/publish", response_model=FlowVersion)
+    def publish_flow(
+        flow_id: str, payload: FlowPublishRequest, request: Request
+    ) -> FlowVersion:
+        store: FlowStore = request.app.state.service.flow_store
+        draft = store.get(flow_id)
+        if draft is None:
+            raise HTTPException(status_code=404, detail=f"unknown draft: {flow_id}")
+        validation = validate_flow(draft)
+        if not validation.valid:
+            raise HTTPException(status_code=422, detail=validation.model_dump(mode="json"))
+        try:
+            version = store.publish(flow_id, expected_revision=payload.expected_revision)
+        except FlowRevisionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FlowNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _audit_request(
+            request,
+            action="flow.published",
+            resource_type="flow",
+            resource_id=flow_id,
+            details={"version": version.version, "sha256": version.sha256},
+        )
+        return version
+
+    @application.get("/v1/flows/{flow_id}/versions", response_model=list[FlowVersion])
+    def flow_versions(flow_id: str, request: Request) -> list[FlowVersion]:
+        return request.app.state.service.flow_store.versions(flow_id)
+
+    @application.post(
+        "/v1/flows/{flow_id}/runs",
+        response_model=FlowRun,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def start_flow_run(
+        flow_id: str, payload: FlowRunRequest, request: Request
+    ) -> FlowRun:
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        try:
+            run = runtime.start(flow_id, version=payload.version, inputs=payload.inputs)
+        except (GraphRuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _audit_request(
+            request,
+            action="flow.run.created",
+            resource_type="flow-run",
+            resource_id=run.id,
+            details={"flow_id": flow_id, "version": run.flow_version},
+        )
+        return run
+
+    @application.get("/v1/runs", response_model=list[FlowRun])
+    def flow_runs(request: Request, limit: int = 100) -> list[FlowRun]:
+        if limit < 1 or limit > 500:
+            raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        return runtime.list(limit=limit)
+
+    @application.get("/v1/runs/{run_id}", response_model=FlowRun)
+    def get_flow_run(run_id: str, request: Request) -> FlowRun:
+        if not IDENTIFIER_PATTERN.fullmatch(run_id):
+            raise HTTPException(status_code=400, detail="invalid run_id")
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        run = runtime.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="flow run not found")
+        return run
+
+    @application.post(
+        "/v1/runs/{run_id}/review",
+        response_model=FlowRun,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def review_flow_run(
+        run_id: str, payload: ReviewDecision, request: Request
+    ) -> FlowRun:
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        try:
+            return runtime.review(run_id, payload)
+        except (GraphRuntimeError, WorkflowExecutionError) as exc:
+            code = 404 if str(exc).startswith("unknown flow run") else 409
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+
+    @application.post(
+        "/v1/runs/{run_id}/cancel",
+        response_model=FlowRun,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def cancel_flow_run(
+        run_id: str, payload: WorkflowActionRequest, request: Request
+    ) -> FlowRun:
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        try:
+            return runtime.cancel(run_id, reason=payload.reason)
+        except (GraphRuntimeError, WorkflowExecutionError) as exc:
+            code = 404 if str(exc).startswith("unknown flow run") else 409
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+
+    @application.post(
+        "/v1/runs/{run_id}/retry",
+        response_model=FlowRun,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def retry_flow_run(
+        run_id: str, payload: WorkflowActionRequest, request: Request
+    ) -> FlowRun:
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        try:
+            return runtime.retry(run_id, reason=payload.reason)
+        except (GraphRuntimeError, WorkflowExecutionError) as exc:
+            code = 404 if str(exc).startswith("unknown flow run") else 409
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+
+    @application.post(
+        "/v1/runs/{run_id}/nodes/{node_id}/retry",
+        response_model=FlowRun,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def retry_flow_node(
+        run_id: str, node_id: str, payload: WorkflowActionRequest, request: Request
+    ) -> FlowRun:
+        if not IDENTIFIER_PATTERN.fullmatch(node_id):
+            raise HTTPException(status_code=400, detail="invalid node_id")
+        runtime = getattr(request.app.state.service, "graph_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="graph runtime is not configured")
+        try:
+            return runtime.retry_node(run_id, node_id, reason=payload.reason)
+        except (GraphRuntimeError, WorkflowExecutionError) as exc:
+            code = 404 if str(exc).startswith("unknown flow run") else 409
+            raise HTTPException(status_code=code, detail=str(exc)) from exc
+
     @application.post(
         "/v1/analysis",
         response_model=WorkflowInstance,
@@ -278,6 +677,82 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except WorkflowExecutionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.post(
+        "/v1/bug-finding",
+        response_model=WorkflowInstance,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def request_bug_finding(payload: BugFindingRequest, request: Request) -> WorkflowInstance:
+        engine = getattr(request.app.state.service, "workflow_engine", None)
+        if engine is None:
+            raise HTTPException(status_code=503, detail="workflow engine is not configured")
+        search_query = " ".join(
+            part for part in (payload.scope, payload.symptoms or "") if part
+        )[:2000]
+        trigger = TriggerEvent(
+            source="manual",
+            event="bug-finding.requested",
+            event_id=f"bug-finding-{uuid4().hex}",
+            data={
+                "repository": {
+                    "full_name": payload.repository,
+                    "ref": payload.ref,
+                },
+                "scope": payload.scope,
+                "symptoms": payload.symptoms,
+                "logs": payload.logs,
+                "constraints": payload.constraints,
+                "search_query": search_query,
+            },
+        )
+        try:
+            workflow, created = engine.create(trigger)
+            enqueued = request.app.state.service.workflow_queue.enqueue(workflow.id)
+            if not enqueued:
+                raise WorkflowExecutionError("bug-finding workflow could not be queued")
+            _audit_request(
+                request,
+                action="bug-finding.requested",
+                resource_type="workflow",
+                resource_id=workflow.id,
+                details={
+                    "created": created,
+                    "repository": payload.repository,
+                    "ref": payload.ref,
+                    "scope_length": len(payload.scope),
+                    "has_symptoms": payload.symptoms is not None,
+                    "has_logs": payload.logs is not None,
+                },
+            )
+            return workflow
+        except ScenarioResolutionError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except WorkflowExecutionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @application.post(
+        "/v1/events",
+        response_model=FlowTriggerDispatch,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def receive_flow_event(payload: TriggerEvent, request: Request) -> FlowTriggerDispatch:
+        try:
+            result = _dispatch_published_flows(request.app.state.service, payload)
+        except (GraphRuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        _audit_request(
+            request,
+            action="flow.trigger.received",
+            resource_type="flow-trigger",
+            resource_id=payload.event_id,
+            details={
+                "source": payload.source,
+                "event": payload.event,
+                "matched_flows": [run.flow_id for run in result.flow_runs],
+            },
+        )
+        return result
 
     @application.post(
         "/v1/triggers",
@@ -377,8 +852,16 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         engine = getattr(request.app.state.service, "workflow_engine", None)
         if engine is None:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
+        flow_dispatch: FlowTriggerDispatch | None = None
+        flow_details: dict[str, Any] = {}
         try:
             trigger = engine.attach_plane_implementation(normalized.trigger)
+            flow_dispatch = _dispatch_published_flows(request.app.state.service, trigger)
+            flow_details = (
+                {"flow_runs": [run.model_dump(mode="json") for run in flow_dispatch.flow_runs]}
+                if flow_dispatch.flow_runs
+                else {}
+            )
             if trigger.event == "issue.cancelled":
                 active = engine.find_plane_workflow(
                     trigger,
@@ -390,6 +873,8 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                     statuses={"CREATED", "RUNNING", "WAITING"},
                 )
                 if active is None:
+                    if flow_dispatch.flow_runs:
+                        return {"accepted": True, **flow_details}
                     return {"accepted": False, "reason": "no active workflow to cancel"}
                 workflow = engine.cancel(active.id, reason="Plane issue moved to Cancelled")
                 request.app.state.service.workflow_queue.cancel_pending(workflow.id)
@@ -405,6 +890,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                     "created": False,
                     "enqueued": False,
                     "workflow": workflow.model_dump(mode="json"),
+                    **flow_details,
                 }
 
             resumed_development = None
@@ -441,6 +927,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                             "created": False,
                             "enqueued": True,
                             "workflow": resumed_development.model_dump(mode="json"),
+                            **flow_details,
                         }
 
             if trigger.event == "issue.testing":
@@ -455,6 +942,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                         "created": False,
                         "enqueued": False,
                         "workflow": active_testing.model_dump(mode="json"),
+                        **flow_details,
                     }
             workflow, created = engine.create(trigger)
             enqueued = False
@@ -476,6 +964,7 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 "created": created,
                 "enqueued": enqueued,
                 "workflow": workflow.model_dump(mode="json"),
+                **flow_details,
                 **(
                     {"development_workflow_id": resumed_development.id}
                     if resumed_development is not None
@@ -483,18 +972,22 @@ def create_app(service: AgentService | None = None) -> FastAPI:
                 ),
             }
         except ScenarioResolutionError as exc:
+            if flow_dispatch is not None and flow_dispatch.flow_runs:
+                return {"accepted": True, **flow_details}
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except GraphRuntimeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except WorkflowExecutionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @application.post(
         "/v1/webhooks/gitea",
-        response_model=WorkflowInstance | IgnoredWebhook,
+        response_model=WorkflowInstance | IgnoredWebhook | FlowTriggerDispatch,
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def receive_gitea_webhook(
         request: Request,
-    ) -> WorkflowInstance | IgnoredWebhook:
+    ) -> WorkflowInstance | IgnoredWebhook | FlowTriggerDispatch:
         secret = os.environ.get("GITEA_WEBHOOK_SECRET", "").strip()
         if not secret:
             raise HTTPException(status_code=503, detail="Gitea webhook is not configured")
@@ -534,6 +1027,31 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         engine = getattr(request.app.state.service, "workflow_engine", None)
         if engine is None:
             raise HTTPException(status_code=503, detail="workflow engine is not configured")
+        automation_push = event_type == "push" and str(payload.get("ref") or "").startswith(
+            "refs/heads/automation/"
+        )
+        try:
+            flow_dispatch = (
+                FlowTriggerDispatch(
+                    accepted=False,
+                    source="gitea",
+                    event=event_type,
+                    event_id=delivery,
+                    reason="automation branch events are suppressed",
+                )
+                if automation_push
+                else _dispatch_published_flows(
+                    request.app.state.service,
+                    TriggerEvent(
+                        source="gitea",
+                        event=event_type,
+                        event_id=delivery,
+                        data=payload,
+                    ),
+                )
+            )
+        except GraphRuntimeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         pull_action = str(payload.get("action") or "").lower()
         is_pull_closed = event_type in GITEA_PULL_EVENTS and pull_action in {
             "closed",
@@ -542,6 +1060,8 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         if event_type in GITEA_REVIEW_OUTCOMES or is_pull_closed:
             workflow_id = _workflow_marker(payload)
             if workflow_id is None:
+                if flow_dispatch.flow_runs:
+                    return flow_dispatch
                 raise HTTPException(status_code=422, detail="Gitea decision has no workflow marker")
             workflow = engine.get(workflow_id)
             if workflow is None:
@@ -614,6 +1134,8 @@ def create_app(service: AgentService | None = None) -> FastAPI:
         if event_type in GITEA_PULL_EVENTS:
             workflow_id = _workflow_marker(payload)
             if workflow_id is None:
+                if flow_dispatch.flow_runs:
+                    return flow_dispatch
                 raise HTTPException(
                     status_code=422, detail="Gitea pull request has no workflow marker"
                 )
@@ -623,6 +1145,15 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             return workflow
 
         if event_type == "push":
+            if flow_dispatch.flow_runs:
+                _audit_request(
+                    request,
+                    action="gitea.flow-trigger.accepted",
+                    resource_type="flow-trigger",
+                    resource_id=delivery,
+                    details={"matched_flows": [run.flow_id for run in flow_dispatch.flow_runs]},
+                )
+                return flow_dispatch
             _audit_request(
                 request,
                 action="gitea.webhook.ignored",
@@ -701,6 +1232,10 @@ def create_app(service: AgentService | None = None) -> FastAPI:
             )
             return workflow
         except ScenarioResolutionError as exc:
+            if flow_dispatch.flow_runs:
+                return flow_dispatch
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except GraphRuntimeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except WorkflowExecutionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

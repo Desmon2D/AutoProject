@@ -35,16 +35,34 @@ def _advance(service: AgentService, workflow_id: str):
     workflow = service.workflow_engine.get(workflow_id)
     if workflow is None:
         raise RuntimeError(f"queued workflow does not exist: {workflow_id}")
-    if workflow.status in {"WAITING", "COMPLETED", "FAILED", "CANCELLED"}:
-        return workflow
-    return service.workflow_engine.advance_safely(workflow)
+    graph_runtime = getattr(service, "graph_runtime", None)
+    is_graph_run = graph_runtime is not None and graph_runtime.run_store.contains(workflow_id)
+    if workflow.status not in {"COMPLETED", "FAILED", "CANCELLED"} and (
+        workflow.status != "WAITING" or workflow.pending_delay is not None
+    ):
+        if is_graph_run:
+            workflow = service.workflow_engine.advance_safely(
+                workflow,
+                transition_budget=1,
+            )
+        else:
+            workflow = service.workflow_engine.advance_safely(workflow)
+    if graph_runtime is not None:
+        graph_runtime.sync(workflow)
+        if is_graph_run:
+            graph_runtime.dispatch_node_outbox(workflow.id)
+    return workflow
 
 
 def reconcile_workflows(service: AgentService) -> dict[str, int]:
     recovered = 0
     failed = 0
+    graph_runtime = getattr(service, "graph_runtime", None)
+    if graph_runtime is not None:
+        graph_runtime.dispatch_pending()
     for workflow in service.workflow_engine.store.list():
-        if workflow.status not in {"CREATED", "RUNNING"}:
+        resumable_delay = workflow.status == "WAITING" and workflow.pending_delay is not None
+        if workflow.status not in {"CREATED", "RUNNING"} and not resumable_delay:
             continue
         queue_job = service.workflow_queue.get(workflow.id)
         if queue_job is not None and queue_job.status == "FAILED":
@@ -56,7 +74,9 @@ def reconcile_workflows(service: AgentService) -> dict[str, int]:
             continue
         if queue_job is None or queue_job.status == "COMPLETED":
             available_at = (
-                workflow.pending_retry.available_at.timestamp()
+                workflow.pending_delay.available_at.timestamp()
+                if workflow.pending_delay is not None
+                else workflow.pending_retry.available_at.timestamp()
                 if workflow.pending_retry is not None
                 else None
             )
@@ -109,6 +129,18 @@ def process_one(
                 job.workflow_id,
                 workflow.pending_retry.available_at.isoformat(),
             )
+        elif workflow.pending_delay is not None and workflow.status == "WAITING":
+            if not queue.defer(
+                job.workflow_id,
+                worker_id,
+                available_at=workflow.pending_delay.available_at.timestamp(),
+            ):
+                raise RuntimeError("worker could not defer the delayed workflow")
+            LOGGER.info(
+                "workflow delay scheduled: %s at %s",
+                job.workflow_id,
+                workflow.pending_delay.available_at.isoformat(),
+            )
         else:
             if not queue.complete(job.workflow_id, worker_id):
                 raise RuntimeError("worker could not complete the queue job")
@@ -122,10 +154,13 @@ def process_one(
             retry_delay_seconds=retry_delay_seconds,
         )
         if status == "FAILED":
-            service.workflow_engine.fail_processing(
+            workflow = service.workflow_engine.fail_processing(
                 job.workflow_id,
                 message=str(exc),
             )
+            graph_runtime = getattr(service, "graph_runtime", None)
+            if graph_runtime is not None:
+                graph_runtime.sync(workflow)
         LOGGER.exception("workflow processing failed (%s): %s", status, job.workflow_id)
     finally:
         queue.heartbeat(worker_id)

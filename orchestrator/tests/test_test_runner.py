@@ -148,6 +148,24 @@ def test_archive_normalization_strips_repository_root_and_rejects_links():
         runner._normalize_archive(unsafe.getvalue())
 
 
+def test_reproducer_overlay_is_bounded_and_rejects_unsafe_paths():
+    overlay = DockerTestRunner._build_overlay_archive(
+        {"reproducers/test_bug.py": b"def test_bug():\n    assert False\n"}
+    )
+
+    with tarfile.open(fileobj=io.BytesIO(overlay), mode="r:") as archive:
+        assert archive.getnames() == ["reproducers/test_bug.py"]
+        assert archive.extractfile("reproducers/test_bug.py").read().startswith(b"def test_bug")
+
+    with pytest.raises(TestRunnerError, match="invalid path"):
+        DockerTestRunner._build_overlay_archive({"../escape.py": b"bad"})
+
+    with pytest.raises(TestRunnerError, match="exceeds 1 MiB"):
+        DockerTestRunner._build_overlay_archive(
+            {"reproducers/large.py": b"x" * (1024 * 1024 + 1)}
+        )
+
+
 @pytest.mark.docker
 @pytest.mark.skipif(
     os.environ.get("HARNES_DOCKER_E2E") != "1",
@@ -175,6 +193,13 @@ def test_docker_runner_reads_structured_pytest_report_and_rejects_empty_suite():
         item.size = len(payload)
         archive.addfile(item, io.BytesIO(payload))
     empty = runner.run(empty_archive.getvalue(), ["pytest", "-q"])
+    reproduced = runner.run(
+        empty_archive.getvalue(),
+        ["pytest", "-q", "reproducers/test_bug.py"],
+        overlay_files={
+            "reproducers/test_bug.py": b"def test_bug():\n    assert 2 == 1\n"
+        },
+    )
 
     assert (passed.verdict, passed.framework, passed.total, passed.passed) == (
         "PASSED",
@@ -184,3 +209,8 @@ def test_docker_runner_reads_structured_pytest_report_and_rejects_empty_suite():
     )
     assert empty.verdict == "TEST_CODE_ERROR"
     assert empty.total == 0
+    assert (reproduced.verdict, reproduced.framework, reproduced.failed) == (
+        "PRODUCT_FAILURE",
+        "pytest",
+        1,
+    ), reproduced.output
