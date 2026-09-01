@@ -7,7 +7,9 @@
   },
   "scripts": {
     "dev": "vinext dev",
-    "dev:all": "concurrently --kill-others \"vinext dev\" \"node scripts/scheduler.mjs\"",
+    "dev:all": "concurrently --kill-others \"vinext dev\" \"node scripts/scheduler.mjs\" \"node scripts/code-runner.mjs\" \"node scripts/mock-sources.mjs\"",
+    "runner": "node scripts/code-runner.mjs",
+    "mock-sources": "node scripts/mock-sources.mjs",
     "build": "vinext build",
     "start": "vinext start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",

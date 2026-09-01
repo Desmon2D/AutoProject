@@ -4,6 +4,7 @@ export const tasks = sqliteTable('tasks', {
   id: text('id').primaryKey(), name: text('name').notNull(), description: text('description').notNull(),
   prompt: text('prompt').notNull(), cronExpression: text('cron_expression').notNull(), timezone: text('timezone').notNull(),
   enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true), sourcesJson: text('sources_json').notNull(),
+  toolsJson: text('tools_json').notNull().default('["bash"]'),
   nextRunAt: text('next_run_at'), createdAt: text('created_at').notNull(), updatedAt: text('updated_at').notNull(),
 }, (table) => [index('idx_tasks_due').on(table.enabled, table.nextRunAt)]);
 

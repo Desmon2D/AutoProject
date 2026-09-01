@@ -11,24 +11,42 @@ export async function executeTask(taskId:string,triggerType:RunRecord['triggerTy
     await updateRun(skippedId,{status:'skipped',finishedAt:new Date().toISOString(),warning:'Предыдущий запуск ещё выполняется'});
     return skippedId;
   }
+
   const runId=await createRun(taskId,triggerType,retryOfRunId);
   await updateRun(runId,{status:'running',startedAt:new Date().toISOString()});
   const provider=getMcpProvider();
   const results:SourceResult[]=[];
   const failures:string[]=[];
-  await Promise.all(task.sources.map(async(source)=>{
+
+  await Promise.all(task.sources.map(async source=>{
     const startedAt=new Date().toISOString();
     try {
-      const value=await provider.call(source,task); results.push(value);
+      const value=await provider.call(source,task);
+      results.push(value);
       await addToolCall({runId,source,toolName:value.toolName,status:'success',inputJson:JSON.stringify(value.input),outputJson:JSON.stringify(value.output),errorMessage:null,startedAt,finishedAt:new Date().toISOString()});
     } catch(error) {
-      const message=error instanceof Error?error.message:'Неизвестная ошибка'; failures.push(`${source}: ${message}`);
+      const message=error instanceof Error?error.message:'Неизвестная ошибка';
+      failures.push(`${source}: ${message}`);
       await addToolCall({runId,source,toolName:`${source}.unknown`,status:'failed',inputJson:'{}',outputJson:null,errorMessage:message,startedAt,finishedAt:new Date().toISOString()});
     }
   }));
+
   try {
-    if(!results.length) throw new Error('Все источники завершились с ошибкой');
-    const report=await generateReport(task,results,failures);
+    const report=await generateReport(task,results,failures,async event=>{
+      const startedAt=new Date().toISOString();
+      const executionFailed=Boolean(event.error||event.result?.timedOut||event.result?.exitCode!==0);
+      await addToolCall({
+        runId,
+        source:'code',
+        toolName:'execute_bash',
+        status:executionFailed?'failed':'success',
+        inputJson:JSON.stringify({command:event.command,purpose:event.purpose}),
+        outputJson:event.result?JSON.stringify(event.result):null,
+        errorMessage:event.error??(event.result?.timedOut?'Команда превысила лимит времени':event.result?.exitCode!==0?`Команда завершилась с кодом ${event.result?.exitCode}`:null),
+        startedAt,
+        finishedAt:new Date().toISOString(),
+      });
+    });
     await updateRun(runId,{status:'success',finishedAt:new Date().toISOString(),result:report,warning:failures.length?failures.join('; '):undefined});
   } catch(error) {
     await updateRun(runId,{status:'failed',finishedAt:new Date().toISOString(),error:error instanceof Error?error.message:'Неизвестная ошибка',warning:failures.join('; ')||undefined});

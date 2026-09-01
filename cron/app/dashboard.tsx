@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { describeSchedule, resolveSchedule, scheduleFromCron } from '../lib/schedule';
-import type { RunRecord, ScheduleInput, SourceName, TaskInput, TaskRecord } from '../lib/types';
+import type { RunRecord, ScheduleInput, SourceName, TaskInput, TaskRecord, TaskToolName, ToolCallRecord, ToolSourceName } from '../lib/types';
 
 const blank: TaskInput = {
   name: '',
@@ -12,10 +12,11 @@ const blank: TaskInput = {
   cronExpression: '0 9 * * 1-5',
   timezone: 'Europe/Moscow',
   enabled: true,
-  sources: ['jira', 'git', 'wiki'],
+  sources: ['git', 'plane'],
+  tools: ['bash'],
 };
 const blankSchedule: ScheduleInput = { mode: 'weekdays', time: '09:00' };
-const sourceLabel: Record<SourceName, string> = { jira: 'Jira', git: 'Git', wiki: 'Wiki' };
+const sourceLabel: Record<ToolSourceName, string> = { jira: 'Jira', git: 'Git', wiki: 'Wiki', plane: 'Plane', code: 'Bash' };
 const statusLabel: Record<RunRecord['status'], string> = {
   queued: 'Ожидает',
   running: 'Выполняется',
@@ -106,6 +107,7 @@ export default function Dashboard() {
       timezone: task.timezone,
       enabled: task.enabled,
       sources: task.sources,
+      tools: task.tools,
     } : blank);
     setSchedule(task ? scheduleFromCron(task.cronExpression) : blankSchedule);
     setError('');
@@ -123,6 +125,13 @@ export default function Dashboard() {
       sources: value.sources.includes(source)
         ? value.sources.filter(item => item !== source)
         : [...value.sources, source],
+    }));
+  }
+
+  function toggleTool(tool: TaskToolName) {
+    setForm(value=>({
+      ...value,
+      tools:value.tools.includes(tool)?value.tools.filter(item=>item!==tool):[...value.tools,tool],
     }));
   }
 
@@ -194,6 +203,7 @@ export default function Dashboard() {
       timezone: task.timezone,
       enabled: !task.enabled,
       sources: task.sources,
+      tools: task.tools,
     };
     await fetch(`/api/tasks?id=${task.id}`, {
       method: 'PATCH',
@@ -273,7 +283,14 @@ export default function Dashboard() {
             <div className="source-list source-list-large">
               {selectedTask.sources.map(source => <span key={source}>{sourceLabel[source]}</span>)}
             </div>
-            <dl><div><dt>Часовой пояс</dt><dd>Москва</dd></div><div><dt>Создана</dt><dd>{formatDate(selectedTask.createdAt)}</dd></div></dl>
+              <dl><div><dt>Создана</dt><dd>{formatDate(selectedTask.createdAt)}</dd></div></dl>
+          </article>
+          <article className="information-card tools-card">
+            <div className="card-heading"><span className="card-icon">&gt;_</span><h2>Инструменты</h2></div>
+            {selectedTask.tools.includes('bash') ? <>
+              <div className="tool-module enabled"><strong>Bash-контейнер</strong><span>Доступен для вычислений и коротких команд</span></div>
+              <p className="tool-policy">Изолирован от сети и файлов устройства</p>
+            </> : <div className="tool-module disabled"><strong>Bash-контейнер</strong><span>Отключён для этой задачи</span></div>}
           </article>
         </section>
 
@@ -308,7 +325,15 @@ export default function Dashboard() {
           <label>Инструкция для AI<textarea required rows={4} value={form.prompt} onChange={event => setForm({ ...form, prompt: event.target.value })} /></label>
           <fieldset>
             <legend>Источники данных</legend>
-            <div className="choice-row">{(['jira', 'git', 'wiki'] as SourceName[]).map(source => <button type="button" key={source} className={form.sources.includes(source) ? 'selected' : ''} onClick={() => toggleSource(source)}>{sourceLabel[source]}</button>)}</div>
+            <div className="choice-row">{(['git', 'plane'] as SourceName[]).map(source => <button type="button" key={source} className={form.sources.includes(source) ? 'selected' : ''} onClick={() => toggleSource(source)}>{sourceLabel[source]}</button>)}</div>
+          </fieldset>
+          <fieldset className="tool-selector">
+            <legend>Инструменты</legend>
+            <button type="button" className={`tool-option ${form.tools.includes('bash')?'selected':''}`} onClick={()=>toggleTool('bash')} aria-pressed={form.tools.includes('bash')}>
+              <span className="tool-option-icon">&gt;_</span>
+              <span><strong>Bash-контейнер</strong><small>Вычисления и короткие команды в изолированной среде</small></span>
+              <span className="tool-option-state">{form.tools.includes('bash')?'Включён':'Выключен'}</span>
+            </button>
           </fieldset>
           <ScheduleEditor value={schedule} onChange={changeSchedule} />
           {form.cronExpression && <div className="schedule-summary"><span>Расписание</span><strong>{describeSchedule(form.cronExpression)}</strong></div>}
@@ -388,11 +413,26 @@ function RunDetails({ run, onClose, onRetry }: { run: RunRecord; onClose: () => 
       {run.warningMessage && <div className="warning-box">{run.warningMessage}</div>}
       {run.errorMessage && <div className="error-box">{run.errorMessage}</div>}
       <div className="tool-call-list">
-        <h3>Источники</h3>
-        {run.toolCalls.map(call => <details key={call.id}><summary><span>{sourceLabel[call.source]}</span><span className={`run-status ${call.status === 'success' ? 'success' : 'failed'}`}>{call.status === 'success' ? 'Получено' : 'Ошибка'}</span></summary><pre>{call.errorMessage ?? JSON.stringify(JSON.parse(call.outputJson ?? '{}'), null, 2)}</pre></details>)}
+        <h3>Источники и инструменты</h3>
+        {run.toolCalls.map(call => <details key={call.id}><summary><span>{sourceLabel[call.source]}</span><span className={`run-status ${call.status === 'success' ? 'success' : 'failed'}`}>{call.status === 'success' ? 'Успешно' : 'Ошибка'}</span></summary><ToolCallOutput call={call}/></details>)}
       </div>
       {run.resultMarkdown && <article className="markdown"><ReactMarkdown>{run.resultMarkdown}</ReactMarkdown></article>}
       <div className="modal-actions"><button className="ghost-button" onClick={onClose}>Закрыть</button><button className="primary-button" onClick={onRetry}>Повторить запуск</button></div>
     </section>
+  </div>;
+}
+
+function ToolCallOutput({call}:{call:ToolCallRecord}) {
+  if(call.errorMessage) return <div className="tool-error">{call.errorMessage}</div>;
+  let output:Record<string,unknown>={};
+  try { output=JSON.parse(call.outputJson??'{}') as Record<string,unknown>; } catch { return <pre>{call.outputJson}</pre>; }
+  if(call.source!=='code') return <pre>{JSON.stringify(output,null,2)}</pre>;
+  const stdout=typeof output.stdout==='string'?output.stdout.trim():'';
+  const stderr=typeof output.stderr==='string'?output.stderr.trim():'';
+  return <div className="bash-result">
+    <span className="bash-result-label">Результат Bash</span>
+    <strong>{stdout||'Команда выполнена без вывода'}</strong>
+    {stderr&&<small className="bash-stderr">{stderr}</small>}
+    <details className="technical-details"><summary>Технические детали</summary><pre>{JSON.stringify(output,null,2)}</pre></details>
   </div>;
 }
