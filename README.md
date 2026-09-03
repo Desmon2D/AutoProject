@@ -9,6 +9,7 @@
 |---|---|---|
 | `automation-agent` | Локальная платформа AI-агентов: оркестратор, dashboard, Docker-песочницы и интеграции | [README](projects/automation-agent/README.md) |
 | `cron` | Интерфейс и планировщик автоматических AI-задач | [README](projects/cron/README.md) |
+| `hermes-corporate-desktop` | Корпоративный DIT Agent на базе Hermes Desktop с read-only MCP и LiteLLM | [README](projects/hermes-corporate-desktop/README.md) |
 
 ## Быстрый старт
 
@@ -28,6 +29,15 @@ npm ci
 npm run dev:all
 ```
 
+DIT Agent:
+
+```powershell
+Set-Location projects\hermes-corporate-desktop
+npm install
+Set-Location apps\desktop
+npm run dev:isolated
+```
+
 Команды разработки и переменные окружения описаны в README соответствующего
 проекта. Настоящие `.env`-файлы остаются локальными и не должны попадать в Git.
 
@@ -37,7 +47,8 @@ npm run dev:all
 AutoProject/
 ├── projects/
 │   ├── automation-agent/
-│   └── cron/
+│   ├── cron/
+│   └── hermes-corporate-desktop/
 ├── .gitattributes
 ├── .gitignore
 └── README.md

@@ -1,0 +1,115 @@
+name: hermes-corporate-desktop
+
+services:
+  litellm-postgres:
+    image: postgres:16-alpine
+    container_name: hermes-corporate-litellm-postgres
+    restart: unless-stopped
+    env_file:
+      - ${DIT_LITELLM_ENV_FILE}
+    volumes:
+      - litellm-postgres-data:/var/lib/postgresql/data
+    networks:
+      - ai-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.98.0
+    container_name: hermes-corporate-litellm
+    restart: unless-stopped
+    command: ["--config=/app/config.yaml", "--host=0.0.0.0", "--port=4000"]
+    env_file:
+      - ${DIT_LITELLM_ENV_FILE}
+    depends_on:
+      litellm-postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:4000:4000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./litellm.config.yaml:/app/config.yaml:ro
+    networks:
+      - ai-internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:v0.11.1
+    container_name: hermes-corporate-openwebui
+    restart: unless-stopped
+    env_file:
+      - .env.openwebui
+    depends_on:
+      litellm:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - openwebui-data:/app/backend/data
+    networks:
+      - ai-internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 45s
+
+  hermes:
+    image: nousresearch/hermes-agent:v2026.8.31
+    container_name: hermes-corporate-agent
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    env_file:
+      - .env.hermes
+    ports:
+      - "127.0.0.1:8642:8642"
+      - "127.0.0.1:9119:9119"
+    volumes:
+      - hermes-data:/opt/data
+    networks:
+      - ai-internal
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8642/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    mem_limit: 4g
+    cpus: 2.0
+
+networks:
+  ai-internal:
+    driver: bridge
+
+volumes:
+  openwebui-data:
+    name: hermes-corporate-openwebui-data
+  hermes-data:
+    name: hermes-corporate-agent-data
+  litellm-postgres-data:
+    name: hermes-corporate-litellm-postgres-data

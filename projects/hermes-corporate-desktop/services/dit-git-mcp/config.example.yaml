@@ -1,0 +1,46 @@
+mcp_servers:
+  dit_git:
+    command: dit-git-mcp
+    args:
+      - --base-url
+      - https://git.mos.ru
+      - --allow-group
+      - REPLACE_WITH_ALLOWED_GROUP
+      # If git.mos.ru uses a private CA:
+      # - --ca-bundle
+      # - C:/ProgramData/DIT/certs/git-mos-ru-ca.pem
+      # Bounded response limits:
+      # - --max-tree-entries
+      # - "500"
+      # - --max-diff-chars
+      # - "60000"
+      # - --max-job-log-chars
+      # - "40000"
+    env:
+      DIT_GIT_TOKEN: ${DIT_GIT_TOKEN}
+    enabled: true
+    trust: untrusted
+    timeout: 60
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - git_get_project
+        - git_search_projects
+        - git_list_tree
+        - git_read_file
+        - git_read_files
+        - git_search_code
+        - git_list_refs
+        - git_list_commits
+        - git_get_commit
+        - git_compare_refs
+        - git_list_merge_requests
+        - git_get_merge_request
+        - git_list_pipelines
+        - git_get_pipeline
+        - git_get_job_log
+        - git_blame_file
+        - git_list_releases
+      resources: false
+      prompts: false

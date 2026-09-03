@@ -1,0 +1,110 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "id": "dit_git",
+      "name": "DIT Git",
+      "description": "Read-only GitLab access",
+      "command": {
+        "root": "repository",
+        "path": ".venv/Scripts/dit-git-mcp.exe"
+      },
+      "args": [
+        "--base-url",
+        "https://git.mos.ru",
+        "--allow-all-visible",
+        "--timeout",
+        "10",
+        "--retries",
+        "0"
+      ],
+      "requiredEnv": ["DIT_GIT_TOKEN"],
+      "optional": false
+    },
+    {
+      "id": "dit_outlook",
+      "name": "DIT Outlook",
+      "description": "Read-only Exchange mail and calendar access",
+      "command": {
+        "root": "localAppData",
+        "path": "DIT-Agent/mcp/exchange-ews-mcp/.venv/Scripts/exchange-ews-mcp-server.exe"
+      },
+      "env": {
+        "NO_PROXY": "owa.mos.ru"
+      },
+      "requiredEnv": [],
+      "optional": true
+    },
+    {
+      "id": "dit_staff",
+      "name": "DIT Staff",
+      "description": "Read-only corporate staff portal access",
+      "command": {
+        "root": "repository",
+        "path": ".venv/Scripts/dit-staff-mcp.exe"
+      },
+      "args": ["--base-url", "https://staff.mos.ru/mira"],
+      "requiredEnv": [],
+      "optionalEnv": ["DIT_STAFF_LOGIN", "DIT_STAFF_PASSWORD"],
+      "optional": false
+    },
+    {
+      "id": "dit_cfc",
+      "name": "DIT CFC",
+      "description": "Read-only CFC employee directory access",
+      "command": {
+        "root": "repository",
+        "path": ".venv/Scripts/dit-cfc-mcp.exe"
+      },
+      "args": ["--base-url", "https://cfc.mos.ru/", "--no-env-proxy"],
+      "requiredEnv": [],
+      "optional": false
+    },
+    {
+      "id": "dit_jira",
+      "name": "DIT Jira",
+      "description": "Read-only Jira projects and issues",
+      "command": {
+        "root": "repository",
+        "path": ".venv/Scripts/dit-jira-mcp.exe"
+      },
+      "args": [
+        "--base-url",
+        "https://itpm.mos.ru",
+        "--auth-type",
+        "pat",
+        "--allow-all-visible",
+        "--no-env-proxy",
+        "--timeout",
+        "20",
+        "--retries",
+        "1"
+      ],
+      "requiredEnv": ["DIT_JIRA_TOKEN"],
+      "optional": false
+    },
+    {
+      "id": "dit_confluence",
+      "name": "DIT Confluence",
+      "description": "Read-only Confluence spaces and content",
+      "command": {
+        "root": "repository",
+        "path": ".venv/Scripts/dit-confluence-mcp.exe"
+      },
+      "args": [
+        "--base-url",
+        "https://itpm-wiki.mos.ru",
+        "--auth-type",
+        "pat",
+        "--allow-all-visible",
+        "--no-env-proxy",
+        "--timeout",
+        "20",
+        "--retries",
+        "1"
+      ],
+      "requiredEnv": ["DIT_CONFLUENCE_TOKEN"],
+      "optional": false
+    }
+  ]
+}

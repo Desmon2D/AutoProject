@@ -1,0 +1,26 @@
+mcp_servers:
+  dit_cfc:
+    command: dit-cfc-mcp
+    args:
+      - --base-url
+      - https://cfc.mos.ru/
+      - --no-env-proxy
+      # If a corporate CA is required:
+      # - --ca-bundle
+      # - C:/ProgramData/DIT/certs/mos-ru-ca.pem
+    # Browser session cookies are read from Windows Credential Manager.
+    enabled: true
+    trust: untrusted
+    timeout: 60
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - cfc_get_my_profile
+        - cfc_get_home_summary
+        - cfc_list_sections
+        - cfc_read_section
+        - cfc_search_employees
+        - cfc_get_employee_structure
+      resources: false
+      prompts: false

@@ -1,0 +1,29 @@
+mcp_servers:
+  dit_staff:
+    command: dit-staff-mcp
+    args:
+      - --base-url
+      - https://staff.mos.ru/mira
+      # Add --no-env-proxy only if staff.mos.ru must always be reached directly.
+      # If a corporate CA is required:
+      # - --ca-bundle
+      # - C:/ProgramData/DIT/certs/mos-ru-ca.pem
+    # Credentials are read from Windows Credential Manager target DIT-Agent/Staff.
+    # Environment variables DIT_STAFF_LOGIN and DIT_STAFF_PASSWORD override it.
+    enabled: true
+    trust: untrusted
+    timeout: 60
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - staff_get_my_profile
+        - staff_get_home_summary
+        - staff_list_sections
+        - staff_read_section
+        - staff_list_my_learning
+        - staff_list_my_certificates
+        - staff_list_my_adaptation_plans
+        - staff_list_my_adaptation_stages
+      resources: false
+      prompts: false

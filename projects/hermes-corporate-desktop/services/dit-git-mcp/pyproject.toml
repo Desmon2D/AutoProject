@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dit-git-mcp"
+version = "0.3.0"
+description = "Read-only MCP server for the DIT self-managed GitLab instance"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx==0.28.1",
+  "mcp==2.0.0",
+]
+
+[project.scripts]
+dit-git-mcp = "dit_git_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

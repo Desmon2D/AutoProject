@@ -1,0 +1,42 @@
+mcp_servers:
+  dit_confluence:
+    command: dit-confluence-mcp
+    args:
+      - --base-url
+      - https://itpm-wiki.mos.ru
+      - --auth-type
+      - pat
+      - --allow-all-visible
+      - --no-env-proxy
+      # To restrict access locally instead, remove --allow-all-visible and repeat:
+      # - --allow-space
+      # - SPACE_KEY
+      # If Confluence uses a private CA:
+      # - --ca-bundle
+      # - C:/ProgramData/DIT/certs/itpm-wiki-mos-ru-ca.pem
+    env:
+      DIT_CONFLUENCE_TOKEN: ${DIT_CONFLUENCE_TOKEN}
+    enabled: true
+    trust: untrusted
+    timeout: 60
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - confluence_get_server_info
+        - confluence_get_current_user
+        - confluence_list_spaces
+        - confluence_get_space
+        - confluence_search_text
+        - confluence_search_content
+        - confluence_get_content
+        - confluence_list_page_children
+        - confluence_list_comments
+        - confluence_list_attachments
+        - confluence_list_content_versions
+        - confluence_list_labels
+        - confluence_list_content_properties
+        - confluence_get_content_property
+        - confluence_get_content_restrictions
+      resources: false
+      prompts: false

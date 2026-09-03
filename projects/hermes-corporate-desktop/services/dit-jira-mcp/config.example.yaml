@@ -1,0 +1,40 @@
+mcp_servers:
+  dit_jira:
+    command: dit-jira-mcp
+    args:
+      - --base-url
+      - https://itpm.mos.ru
+      - --auth-type
+      - pat
+      - --allow-all-visible
+      - --no-env-proxy
+      # To restrict access locally instead, remove --allow-all-visible and repeat:
+      # - --allow-project
+      # - PROJECT_KEY
+      # If Jira uses a private CA:
+      # - --ca-bundle
+      # - C:/ProgramData/DIT/certs/itpm-mos-ru-ca.pem
+    env:
+      DIT_JIRA_TOKEN: ${DIT_JIRA_TOKEN}
+    enabled: true
+    trust: untrusted
+    timeout: 60
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - jira_get_server_info
+        - jira_get_current_user
+        - jira_list_projects
+        - jira_list_fields
+        - jira_get_project_schema
+        - jira_search_issues
+        - jira_get_issue
+        - jira_get_issue_changelog
+        - jira_get_issue_comments
+        - jira_get_issue_transitions
+        - jira_list_favourite_filters
+        - jira_list_boards
+        - jira_list_sprints
+      resources: false
+      prompts: false
