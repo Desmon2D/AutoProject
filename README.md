@@ -1,74 +1,47 @@
 # AutoProject
 
-Локальная платформа для выполнения корпоративных процессов с помощью AI-агентов.
-Оркестратор принимает события, выполняет JSON-сценарии как граф шагов и запускает
-каждый агентный шаг в отдельной Docker-песочнице.
+Монорепозиторий независимых проектов автоматизации. Каждый проект хранит свои
+зависимости, конфигурацию, документацию и команды запуска в отдельном каталоге.
 
-## Быстрый запуск
+## Проекты
 
-Требуются Docker Desktop и PowerShell 7.
+| Проект | Назначение | Документация |
+|---|---|---|
+| `automation-agent` | Локальная платформа AI-агентов: оркестратор, dashboard, Docker-песочницы и интеграции | [README](projects/automation-agent/README.md) |
+| `cron` | Интерфейс и планировщик автоматических AI-задач | [README](projects/cron/README.md) |
+
+## Быстрый старт
+
+Платформа агентов:
 
 ```powershell
+Set-Location projects\automation-agent
 .\scripts\dev\start-low-memory.ps1
 ```
 
-Dashboard будет доступен по адресу `http://127.0.0.1:4173`, API оркестратора —
-по адресу `http://127.0.0.1:8080`.
-
-Для запуска с Gitea:
+AI Cron:
 
 ```powershell
-.\scripts\dev\start-low-memory.ps1 -WithGitea
-```
-
-Настройка OpenRouter и smoke-проверка:
-
-```powershell
-.\scripts\setup\configure-openrouter.ps1
-.\scripts\smoke\openrouter-smoke.ps1 -SkipBuild
-```
-
-## Структура репозитория
-
-| Каталог | Назначение |
-|---|---|
-| `orchestrator/` | FastAPI API, workflow engine, очередь, реестры и управление агентами |
-| `sandbox/` | Изолированная среда выполнения агента и runtime-манифесты образов |
-| `dashboard/` | Локальная панель состояния и действий над workflow |
-| `cron/` | Интерфейс и планировщик автоматических AI-задач |
-| `infra/` | Конфигурация локальных инфраструктурных сервисов Plane и SWIRL |
-| `scripts/dev/` | Запуск и подготовка локального контура |
-| `scripts/setup/` | Настройка провайдеров и секретов разработки |
-| `scripts/smoke/` | Сквозные и интеграционные smoke-проверки |
-| `docs/` | Архитектура, обзор, планы компонентов и roadmap |
-
-Плагины Harness находятся в `orchestrator/plugins/<name>/`: манифест лежит в
-`plugin.json`, реализация — в `source/`. Каталог `orchestrator/image-catalog/`
-описывает доступные оркестратору образы, а `sandbox/runtime-manifests/` содержит
-манифесты, встраиваемые непосредственно в эти образы.
-
-## Документация
-
-- [Обзор платформы](docs/overview.md)
-- [Полная архитектура](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
-- [Оркестратор](orchestrator/README.md)
-- [Песочница](sandbox/README.md)
-- [Dashboard](dashboard/README.md)
-- [AI Cron](cron/README.md)
-
-## Проверки
-
-```powershell
-Set-Location orchestrator
-uv sync --extra dev
-uv run pytest -m "not docker"
-uv run ruff check .
-
-Set-Location ..\dashboard
+Set-Location projects\cron
+Copy-Item .env.example .env
 npm ci
-npm test
-npm run lint
+npm run dev:all
 ```
 
-Docker-проверки требуют запущенный Docker Engine и подготовленные sandbox-образы.
+Команды разработки и переменные окружения описаны в README соответствующего
+проекта. Настоящие `.env`-файлы остаются локальными и не должны попадать в Git.
+
+## Структура
+
+```text
+AutoProject/
+├── projects/
+│   ├── automation-agent/
+│   └── cron/
+├── .gitattributes
+├── .gitignore
+└── README.md
+```
+
+Для новой работы создавайте обычные feature/fix-ветки от `main`; отдельный
+проект добавляйте новым каталогом внутри `projects/`.
