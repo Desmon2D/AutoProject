@@ -1,0 +1,19 @@
+mcp_servers:
+  dit_outlook:
+    command: C:/path/to/hermes-corporate-desktop/services/dit-outlook-mcp/.venv/Scripts/dit-outlook-mcp.exe
+    env:
+      NO_PROXY: owa.mos.ru
+    enabled: true
+    trust: untrusted
+    timeout: 60
+    connect_timeout: 30
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - search_mail
+        - read_mail
+        - resolve_people
+        - read_calendar
+        - find_meeting_times
+      resources: false
+      prompts: false

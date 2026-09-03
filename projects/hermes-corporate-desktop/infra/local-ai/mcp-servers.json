@@ -26,14 +26,14 @@
       "name": "DIT Outlook",
       "description": "Read-only Exchange mail and calendar access",
       "command": {
-        "root": "localAppData",
-        "path": "DIT-Agent/mcp/exchange-ews-mcp/.venv/Scripts/exchange-ews-mcp-server.exe"
+        "root": "repository",
+        "path": "services/dit-outlook-mcp/.venv/Scripts/dit-outlook-mcp.exe"
       },
       "env": {
         "NO_PROXY": "owa.mos.ru"
       },
       "requiredEnv": [],
-      "optional": true
+      "optional": false
     },
     {
       "id": "dit_staff",

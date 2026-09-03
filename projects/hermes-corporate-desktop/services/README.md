@@ -8,15 +8,11 @@
 | Сервис | Источник | Авторизация | Код |
 | --- | --- | --- | --- |
 | DIT Git | GitLab REST API v4 | Personal Access Token в `DIT_GIT_TOKEN` | [`dit-git-mcp`](dit-git-mcp/) |
+| DIT Outlook | Exchange EWS + NTLM | пароль в Windows Credential Manager | [`dit-outlook-mcp`](dit-outlook-mcp/) |
 | DIT Staff | Mirapolis web/API | локальная сессия или учётные данные в Windows Credential Manager | [`dit-staff-mcp`](dit-staff-mcp/) |
 | DIT CFC | корпоративный web/API | cookies браузерной сессии в Windows Credential Manager | [`dit-cfc-mcp`](dit-cfc-mcp/) |
 | DIT Jira | Jira Server/Data Center REST API | PAT или Basic Auth; по умолчанию PAT в `DIT_JIRA_TOKEN` | [`dit-jira-mcp`](dit-jira-mcp/) |
 | DIT Confluence | Confluence Server/Data Center REST API | PAT или Basic Auth; по умолчанию PAT в `DIT_CONFLUENCE_TOKEN` | [`dit-confluence-mcp`](dit-confluence-mcp/) |
-
-Outlook/EWS пока подключается как внешняя опциональная зависимость и не входит
-в этот репозиторий. Локальный стенд ожидает её по пути
-`%LOCALAPPDATA%\DIT-Agent\mcp\exchange-ews-mcp`; при отсутствии сервер будет
-пропущен с предупреждением.
 
 ## Установка серверов из репозитория
 
@@ -29,6 +25,13 @@ uv pip install --python .venv\Scripts\python.exe `
   -e services\dit-cfc-mcp `
   -e services\dit-jira-mcp `
   -e services\dit-confluence-mcp
+```
+
+Outlook MCP устанавливается отдельно из-за несовместимой основной версии
+библиотеки `mcp`:
+
+```powershell
+.\services\dit-outlook-mcp\install.ps1
 ```
 
 Конкретные переменные, браузерная авторизация и MCP-конфигурация описаны в

@@ -57,7 +57,8 @@ The server list, commands, corporate endpoints, and OpenWebUI labels have one
 source of truth: [`mcp-servers.json`](mcp-servers.json). Add or change a server
 there instead of editing both the Python bridge and PowerShell launcher.
 
-Before the first run, install the five MCP packages shipped by this repository:
+Before the first run, install the five MCP packages that share the project
+virtual environment:
 
 ```powershell
 uv pip install --python .venv\Scripts\python.exe `
@@ -68,12 +69,19 @@ uv pip install --python .venv\Scripts\python.exe `
   -e services\dit-confluence-mcp
 ```
 
+Install the Outlook MCP into its separate compatible environment:
+
+```powershell
+.\services\dit-outlook-mcp\install.ps1
+```
+
 Copy the three UI/MCP `*.env.example` templates to their corresponding ignored
 `.env.*` files and replace placeholders locally. Corporate API tokens continue
 to live in the isolated DIT Agent home. A server whose required token is absent
 is skipped with a warning; a missing in-repository executable remains a setup
-error. Outlook is explicitly optional because its source is currently external
-to this repository.
+error. Outlook configuration and its Windows Credential Manager password stay
+local, while its read-only facade and reproducible installer are stored in this
+repository.
 
 ```powershell
 Copy-Item infra\local-ai\hermes.env.example infra\local-ai\.env.hermes

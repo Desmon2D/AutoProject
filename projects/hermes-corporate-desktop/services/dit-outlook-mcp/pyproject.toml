@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dit-outlook-mcp"
+version = "0.1.0"
+description = "Read-only MCP facade for the DIT on-premises Exchange server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "exchange-ews-mcp @ https://github.com/ShermanGu/exchange-ews-mcp/archive/859b275db83184c9125ae50551c8d0fe89ad1c39.zip#sha256=38e9db7e62d6581b0fb0785d5c825d39c907105ae101d12ac5a3aa153f1eb0a8",
+]
+
+[project.scripts]
+dit-outlook-mcp = "dit_outlook_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
