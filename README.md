@@ -35,6 +35,7 @@ Dashboard будет доступен по адресу `http://127.0.0.1:4173`,
 | `orchestrator/` | FastAPI API, workflow engine, очередь, реестры и управление агентами |
 | `sandbox/` | Изолированная среда выполнения агента и runtime-манифесты образов |
 | `dashboard/` | Локальная панель состояния и действий над workflow |
+| `cron/` | Интерфейс и планировщик автоматических AI-задач |
 | `infra/` | Конфигурация локальных инфраструктурных сервисов Plane и SWIRL |
 | `scripts/dev/` | Запуск и подготовка локального контура |
 | `scripts/setup/` | Настройка провайдеров и секретов разработки |
@@ -54,6 +55,7 @@ Dashboard будет доступен по адресу `http://127.0.0.1:4173`,
 - [Оркестратор](orchestrator/README.md)
 - [Песочница](sandbox/README.md)
 - [Dashboard](dashboard/README.md)
+- [AI Cron](cron/README.md)
 
 ## Проверки
 

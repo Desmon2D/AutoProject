@@ -1,0 +1,1 @@
+ALTER TABLE `tasks` ADD `tools_json` text DEFAULT '["bash"]' NOT NULL;
